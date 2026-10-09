@@ -1,16 +1,22 @@
-param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Sources)
+﻿param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Sources)
 $ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName Microsoft.VisualBasic
 [Windows.Forms.Application]::EnableVisualStyles()
+# Application state shared by the UI event handlers and copy functions.
 $script:settings=Join-Path $env:APPDATA 'MultiDriveCopy\presets.json'
 $script:presets=[ordered]@{}
 $script:all=$null
 $script:cancel=$false
 $script:copied=0
 $script:skipped=0
-function Alert($message) { [Windows.Forms.MessageBox]::Show([string]$message,'Multi Drive Copy','OK','Error')|Out-Null }
+
+function Alert($message) {
+    [Windows.Forms.MessageBox]::Show([string]$message, 'Multi Drive Copy', 'OK', 'Error') | Out-Null
+}
+
+# Validates the destination entered by the user before a drive root is added.
 function Relative($value) {
     $p=([string]$value).Trim().Replace('/','\')
     if($p.StartsWith('\') -or $p -match '^[a-zA-Z]:' -or $p -match '(^|\\)\.\.?($|\\)' -or $p.IndexOfAny([char[]]'<>:"|?*') -ge 0) {throw 'ドライブ文字のない相対パスを入力してください。'}
@@ -32,6 +38,7 @@ function Button($text,$x,$y,$w){
     $b=New-Object Windows.Forms.Button
     $b.Text=$text;$b.SetBounds($x,$y,$w,30);return $b
 }
+# Asks once per collision unless the user chose to apply a choice to all later collisions.
 function Conflict($path){
     if($script:all){return $script:all}
     $dlg=New-Object Windows.Forms.Form
@@ -62,6 +69,7 @@ function Conflict($path){
     $dlg.Dispose()
     return $decision
 }
+# Finds an unused name while retaining the source extension.
 function Unique($path){
     $dir=[IO.Path]::GetDirectoryName($path)
     $base=[IO.Path]::GetFileNameWithoutExtension($path)
@@ -70,6 +78,7 @@ function Unique($path){
     do{$p=Join-Path $dir ('{0} ({1}){2}' -f $base,$n,$ext);$n++}while([IO.File]::Exists($p) -or [IO.Directory]::Exists($p))
     return $p
 }
+# Copies one file and resolves a file or directory collision before writing.
 function CopyFile($src,$dest){
     if($script:cancel){return}
     if([IO.File]::Exists($dest) -or [IO.Directory]::Exists($dest)){
@@ -85,6 +94,7 @@ function CopyFile($src,$dest){
     [IO.File]::Copy($src,$dest,$true)
     $script:copied++
 }
+# Recursively merges a source directory, delegating every file collision to CopyFile.
 function CopyDir($src,$dest){
     if($script:cancel){return}
     if([IO.File]::Exists($dest)){
