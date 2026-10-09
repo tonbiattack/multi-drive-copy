@@ -2,10 +2,13 @@
 Add-Type -AssemblyName System.Windows.Forms
 $source = Join-Path $PSScriptRoot 'MultiDriveCopy.ps1'
 if (!(Test-Path -LiteralPath $source)) { throw 'MultiDriveCopy.ps1 が見つかりません。' }
+$coreSource = Join-Path $PSScriptRoot 'MultiDriveCopy.Core.ps1'
+if (!(Test-Path -LiteralPath $coreSource)) { throw 'MultiDriveCopy.Core.ps1 が見つかりません。' }
 $installDir = Join-Path $env:LOCALAPPDATA 'Programs\MultiDriveCopy'
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 $target = Join-Path $installDir 'MultiDriveCopy.ps1'
 Copy-Item -LiteralPath $source -Destination $target -Force
+Copy-Item -LiteralPath $coreSource -Destination (Join-Path $installDir 'MultiDriveCopy.Core.ps1') -Force
 $sendTo = [Environment]::GetFolderPath('SendTo')
 $shortcut = Join-Path $sendTo 'E F G に一括コピー.lnk'
 $shell = New-Object -ComObject WScript.Shell

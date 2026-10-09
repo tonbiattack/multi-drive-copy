@@ -4,6 +4,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName Microsoft.VisualBasic
 [Windows.Forms.Application]::EnableVisualStyles()
+. (Join-Path $PSScriptRoot 'MultiDriveCopy.Core.ps1')
 # Application state shared by the UI event handlers and copy functions.
 $script:settings=Join-Path $env:APPDATA 'MultiDriveCopy\presets.json'
 $script:presets=[ordered]@{}
@@ -11,6 +12,10 @@ $script:all=$null
 $script:cancel=$false
 $script:copied=0
 $script:skipped=0
+$script:total=0
+$script:lastPreset=$null
+$script:progressBar=$null
+$script:statusLabel=$null
 
 function Alert($message) {
     [Windows.Forms.MessageBox]::Show([string]$message, 'Multi Drive Copy', 'OK', 'Error') | Out-Null
@@ -23,14 +28,13 @@ function Relative($value) {
     return $p.TrimEnd('\')
 }
 function Persist {
-    New-Item -ItemType Directory -Path (Split-Path $script:settings) -Force | Out-Null
-    $data=@($script:presets.Keys|ForEach-Object {@{name=$_;path=$script:presets[$_]}})
-    [IO.File]::WriteAllText($script:settings,(@{presets=$data}|ConvertTo-Json -Depth 5),(New-Object Text.UTF8Encoding($false)))
+    Save-PresetSettings $script:settings $script:presets $script:lastPreset
 }
 if(Test-Path -LiteralPath $script:settings) {
     try {
-        $saved=Get-Content -LiteralPath $script:settings -Raw -Encoding UTF8|ConvertFrom-Json
+        $saved=Get-PresetSettings $script:settings
         foreach($p in @($saved.presets)){if($p.name -and $null -ne $p.path){$script:presets[[string]$p.name]=[string]$p.path}}
+        $script:lastPreset=[string]$saved.lastSelectedPreset
     } catch {Alert "保存設定を読めません: $_"}
 }
 if($script:presets.Count -eq 0){$script:presets['既定 (Backup)']='Backup'}
@@ -93,6 +97,11 @@ function CopyFile($src,$dest){
     New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($dest)) -Force|Out-Null
     [IO.File]::Copy($src,$dest,$true)
     $script:copied++
+    if($script:progressBar){
+        $script:progressBar.Value=[Math]::Min($script:copied+$script:skipped,$script:progressBar.Maximum)
+        $script:statusLabel.Text='コピー: '+$script:copied+' / '+$script:total+' 件（スキップ: '+$script:skipped+' 件）'
+        [Windows.Forms.Application]::DoEvents()
+    }
 }
 # Recursively merges a source directory, delegating every file collision to CopyFile.
 function CopyDir($src,$dest){
@@ -118,6 +127,7 @@ $form=New-Object Windows.Forms.Form
 $form.Text='Multi Drive Copy - E / F / G'
 $form.StartPosition='CenterScreen'
 $form.Size=New-Object Drawing.Size(720,555)
+$form.KeyPreview=$true
 $label=New-Object Windows.Forms.Label
 $label.Text='コピー元（右クリック → 送る で選んだ項目）'
 $label.SetBounds(15,15,670,22)
@@ -161,12 +171,18 @@ $status=New-Object Windows.Forms.Label
 $status.Text='既存フォルダは統合、同名ファイルは確認します。'
 $status.SetBounds(15,412,670,30)
 $form.Controls.Add($status)
+$script:statusLabel=$status
+$progress=New-Object Windows.Forms.ProgressBar
+$progress.SetBounds(15,442,440,18)
+$progress.Minimum=0;$progress.Maximum=1;$progress.Value=0
+$form.Controls.Add($progress)
+$script:progressBar=$progress
 $copy=Button 'コピー開始' 475 453 210
 $copy.Height=36
 $form.Controls.Add($copy)
 $combo.Add_SelectedIndexChanged({
     $name=[string]$combo.SelectedItem
-    if($script:presets.Contains($name)){$pathbox.Text=[string]$script:presets[$name]}
+    if($script:presets.Contains($name)){$pathbox.Text=[string]$script:presets[$name];$script:lastPreset=$name;Persist}
 })
 $save.Add_Click({
     try{
@@ -211,6 +227,8 @@ $copy.Add_Click({
         $question='コピー元: '+$list.Items.Count+' 項目'+[Environment]::NewLine+'コピー先: '+($destinations -join ', ')+[Environment]::NewLine+'コピーしますか？'
         if([Windows.Forms.MessageBox]::Show($question,'実行確認','YesNo','Question') -ne 'Yes'){return}
         $script:all=$null;$script:cancel=$false;$script:copied=0;$script:skipped=0
+        $script:total=(Get-CopyFileCount @($list.Items))*$destinations.Count
+        $progress.Maximum=[Math]::Max(1,$script:total);$progress.Value=0
         $copy.Enabled=$false;$form.Cursor='WaitCursor'
         foreach($root in $destinations){
             foreach($src in $list.Items){
@@ -228,5 +246,10 @@ $copy.Add_Click({
     }catch{Alert ('コピーエラー: '+$_.Exception.Message+' （途中までコピーされている場合があります）')}
     finally{$copy.Enabled=$true;$form.Cursor='Default'}
 })
-$combo.SelectedIndex=0
+$form.Add_KeyDown({
+    if($_.Control -and $_.KeyCode -eq 'Enter'){$copy.PerformClick()}
+    elseif($_.Alt -and $_.KeyCode -eq 'S'){$save.PerformClick()}
+    elseif($_.Alt -and $_.KeyCode -eq 'D'){$remove.PerformClick()}
+})
+if($script:lastPreset -and $combo.Items.Contains($script:lastPreset)){$combo.SelectedItem=$script:lastPreset}else{$combo.SelectedIndex=0}
 [void]$form.ShowDialog()

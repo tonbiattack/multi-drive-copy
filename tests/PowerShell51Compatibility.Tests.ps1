@@ -1,5 +1,6 @@
 ﻿$scriptRoot = Split-Path -Parent $PSScriptRoot
 $scripts = @(
+    'MultiDriveCopy.Core.ps1',
     'MultiDriveCopy.ps1'
     'Install.ps1'
     'Uninstall.ps1'
