@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 $source = Join-Path $PSScriptRoot 'MultiDriveCopy.ps1'
 if (!(Test-Path -LiteralPath $source)) { throw 'MultiDriveCopy.ps1 が見つかりません。' }
