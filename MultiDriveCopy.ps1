@@ -13,9 +13,12 @@ $script:cancel=$false
 $script:copied=0
 $script:skipped=0
 $script:total=0
+$script:totalWork=0
+$script:completedWork=0
 $script:lastPreset=$null
 $script:progressBar=$null
 $script:statusLabel=$null
+$script:copying=$false
 
 function Alert($message) {
     [Windows.Forms.MessageBox]::Show([string]$message, 'Multi Drive Copy', 'OK', 'Error') | Out-Null
@@ -82,26 +85,32 @@ function Unique($path){
     do{$p=Join-Path $dir ('{0} ({1}){2}' -f $base,$n,$ext);$n++}while([IO.File]::Exists($p) -or [IO.Directory]::Exists($p))
     return $p
 }
+function Update-CopyProgress([double]$currentWork=0){
+    if($script:progressBar){
+        $value=if($script:totalWork -gt 0){[Math]::Floor(1000 * [Math]::Min(1.0, ($script:completedWork+$currentWork)/$script:totalWork))}else{0}
+        $script:progressBar.Value=[int]$value
+        $script:statusLabel.Text='処理済み: '+($script:copied+$script:skipped)+' / '+$script:total+' 件（コピー: '+$script:copied+'、スキップ: '+$script:skipped+'）'
+        [Windows.Forms.Application]::DoEvents()
+    }
+}
 # Copies one file and resolves a file or directory collision before writing.
 function CopyFile($src,$dest){
     if($script:cancel){return}
     if([IO.File]::Exists($dest) -or [IO.Directory]::Exists($dest)){
         $choice=Conflict $dest
         switch($choice){
-            'Skip'{$script:skipped++;return}
+            'Skip'{$script:skipped++;$script:completedWork+=([IO.FileInfo]$src).Length+1;Update-CopyProgress;return}
             'Cancel'{$script:cancel=$true;return}
             'Rename'{$dest=Unique $dest}
             'Overwrite'{if([IO.Directory]::Exists($dest)){throw '同名フォルダをファイルで上書きできません: '+$dest}}
         }
     }
     New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($dest)) -Force|Out-Null
-    [IO.File]::Copy($src,$dest,$true)
+    $fileSize=([IO.FileInfo]$src).Length
+    Copy-FileWithProgress $src $dest {param($bytes) Update-CopyProgress $bytes}
     $script:copied++
-    if($script:progressBar){
-        $script:progressBar.Value=[Math]::Min($script:copied+$script:skipped,$script:progressBar.Maximum)
-        $script:statusLabel.Text='コピー: '+$script:copied+' / '+$script:total+' 件（スキップ: '+$script:skipped+' 件）'
-        [Windows.Forms.Application]::DoEvents()
-    }
+    $script:completedWork+=$fileSize+1
+    Update-CopyProgress
 }
 # Recursively merges a source directory, delegating every file collision to CopyFile.
 function CopyDir($src,$dest){
@@ -109,7 +118,7 @@ function CopyDir($src,$dest){
     if([IO.File]::Exists($dest)){
         $choice=Conflict $dest
         switch($choice){
-            'Skip'{$script:skipped++;return}
+            'Skip'{$work=Get-CopyWork @($src);$script:skipped+=$work.Count;$script:completedWork+=$work.Work;Update-CopyProgress;return}
             'Cancel'{$script:cancel=$true;return}
             'Rename'{$dest=Unique $dest}
             'Overwrite'{throw '同名ファイルをフォルダで上書きできません: '+$dest}
@@ -128,6 +137,7 @@ $form.Text='Multi Drive Copy - E / F / G'
 $form.StartPosition='CenterScreen'
 $form.Size=New-Object Drawing.Size(720,555)
 $form.KeyPreview=$true
+$form.Add_FormClosing({if($script:copying){$_.Cancel=$true}})
 $label=New-Object Windows.Forms.Label
 $label.Text='コピー元（右クリック → 送る で選んだ項目）'
 $label.SetBounds(15,15,670,22)
@@ -227,9 +237,13 @@ $copy.Add_Click({
         $question='コピー元: '+$list.Items.Count+' 項目'+[Environment]::NewLine+'コピー先: '+($destinations -join ', ')+[Environment]::NewLine+'コピーしますか？'
         if([Windows.Forms.MessageBox]::Show($question,'実行確認','YesNo','Question') -ne 'Yes'){return}
         $script:all=$null;$script:cancel=$false;$script:copied=0;$script:skipped=0
-        $script:total=(Get-CopyFileCount @($list.Items))*$destinations.Count
-        $progress.Maximum=[Math]::Max(1,$script:total);$progress.Value=0
-        $copy.Enabled=$false;$form.Cursor='WaitCursor'
+        $work=Get-CopyWork @($list.Items)
+        $script:total=$work.Count*$destinations.Count;$script:totalWork=$work.Work*$destinations.Count;$script:completedWork=0
+        $progress.Maximum=1000;$progress.Value=0
+        $script:copying=$true
+        foreach($control in @($list,$combo,$save,$remove,$pathbox,$copy)+$drives){$control.Enabled=$false}
+        $form.Cursor='WaitCursor'
+        Update-CopyProgress
         foreach($root in $destinations){
             foreach($src in $list.Items){
                 if($script:cancel){break}
@@ -240,11 +254,12 @@ $copy.Add_Click({
             }
             if($script:cancel){break}
         }
+        if(!$script:cancel -and $script:totalWork -eq 0){$progress.Value=$progress.Maximum}
         $status.Text='コピー: '+$script:copied+' 件 / スキップ: '+$script:skipped+' 件'
         $heading=if($script:cancel){'処理を中止しました。'}else{'コピーが完了しました。'}
         [Windows.Forms.MessageBox]::Show($heading+' '+$status.Text,'結果','OK','Information')|Out-Null
     }catch{Alert ('コピーエラー: '+$_.Exception.Message+' （途中までコピーされている場合があります）')}
-    finally{$copy.Enabled=$true;$form.Cursor='Default'}
+    finally{$script:copying=$false;foreach($control in @($list,$combo,$save,$remove,$pathbox,$copy)+$drives){$control.Enabled=$true};$form.Cursor='Default'}
 })
 $form.Add_KeyDown({
     if($_.Control -and $_.KeyCode -eq 'Enter'){$copy.PerformClick()}
