@@ -234,8 +234,11 @@ $copy.Add_Click({
                 }
             }
         }
+        $missingDirectories=@(Get-MissingDestinationDirectories $destinations)
         $question='コピー元: '+$list.Items.Count+' 項目'+[Environment]::NewLine+'コピー先: '+($destinations -join ', ')+[Environment]::NewLine+'コピーしますか？'
+        if($missingDirectories.Count){$question+=[Environment]::NewLine+'新規作成するフォルダ:'+[Environment]::NewLine+($missingDirectories -join [Environment]::NewLine)}
         if([Windows.Forms.MessageBox]::Show($question,'実行確認','YesNo','Question') -ne 'Yes'){return}
+        foreach($directory in $missingDirectories){New-Item -ItemType Directory -Path $directory -Force|Out-Null}
         $script:all=$null;$script:cancel=$false;$script:copied=0;$script:skipped=0
         $work=Get-CopyWork @($list.Items)
         $script:total=$work.Count*$destinations.Count;$script:totalWork=$work.Work*$destinations.Count;$script:completedWork=0
