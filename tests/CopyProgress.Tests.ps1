@@ -26,6 +26,17 @@ Describe 'copy progress helpers' {
         $settings.lastSelectedPreset | Should Be 'Daily'
         $settings.presets[0].name | Should Be 'Daily'
     }
+
+    It 'returns each missing destination directory once' {
+        $existing = Join-Path $TestDrive 'existing'
+        $missing = Join-Path $TestDrive 'new\nested'
+        New-Item -ItemType Directory -Path $existing | Out-Null
+
+        $result = @(Get-MissingDestinationDirectories @($existing, $missing, $missing))
+
+        $result.Count | Should Be 1
+        $result[0] | Should Be $missing
+    }
 }
 
 Describe 'copy progress behavior' {

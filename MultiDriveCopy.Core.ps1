@@ -56,6 +56,20 @@ function Get-CopyFileCount {
     return $count
 }
 
+function Get-MissingDestinationDirectories {
+    param([string[]]$Paths)
+
+    $missing = New-Object System.Collections.ArrayList
+    $seen = @{}
+    foreach ($path in $Paths) {
+        if (-not [IO.Directory]::Exists($path) -and -not $seen.ContainsKey($path)) {
+            [void]$seen.Add($path, $true)
+            [void]$missing.Add($path)
+        }
+    }
+    return @($missing)
+}
+
 function Get-PresetSettings {
     param([string]$Path)
 
