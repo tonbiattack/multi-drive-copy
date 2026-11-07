@@ -93,6 +93,11 @@ function Update-CopyProgress([double]$currentWork=0){
         [Windows.Forms.Application]::DoEvents()
     }
 }
+# Releases the closing guard before closing the progress form after its result dialog.
+function Complete-CopyAndClose([Windows.Forms.Form]$CopyForm){
+    $script:copying=$false
+    $CopyForm.Close()
+}
 # Copies one file and resolves a file or directory collision before writing.
 function CopyFile($src,$dest){
     if($script:cancel){return}
@@ -261,6 +266,7 @@ $copy.Add_Click({
         $status.Text='コピー: '+$script:copied+' 件 / スキップ: '+$script:skipped+' 件'
         $heading=if($script:cancel){'処理を中止しました。'}else{'コピーが完了しました。'}
         [Windows.Forms.MessageBox]::Show($heading+' '+$status.Text,'結果','OK','Information')|Out-Null
+        Complete-CopyAndClose $form
     }catch{Alert ('コピーエラー: '+$_.Exception.Message+' （途中までコピーされている場合があります）')}
     finally{$script:copying=$false;foreach($control in @($list,$combo,$save,$remove,$pathbox,$copy)+$drives){$control.Enabled=$true};$form.Cursor='Default'}
 })

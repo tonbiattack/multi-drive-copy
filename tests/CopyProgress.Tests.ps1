@@ -43,7 +43,7 @@ Describe 'copy progress behavior' {
     BeforeAll {
         Add-Type -AssemblyName System.Windows.Forms
         $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $projectRoot 'MultiDriveCopy.ps1'), [ref]$null, [ref]$null)
-        foreach ($name in @('CopyFile', 'CopyDir', 'Update-CopyProgress')) {
+        foreach ($name in @('CopyFile', 'CopyDir', 'Update-CopyProgress', 'Complete-CopyAndClose')) {
             $definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }.GetNewClosure(), $true)
             if ($definition) { . ([scriptblock]::Create($definition.Extent.Text)) }
         }
@@ -91,5 +91,16 @@ Describe 'copy progress behavior' {
         Copy-FileWithProgress $src $dest { param($bytes) [void]$script:observed.Add($bytes) }
         [IO.File]::ReadAllBytes($dest).Length | Should Be (4MB)
         @($script:observed | Where-Object { $_ -gt 0 -and $_ -lt 4MB }).Count | Should BeGreaterThan 0
+    }
+    It 'closes the copy form after a completed result is dismissed' {
+        $form = New-Object Windows.Forms.Form
+        $form.Add_FormClosing({ if ($script:copying) { $_.Cancel = $true } })
+        [void]$form.Handle
+        $script:copying = $true
+
+        Complete-CopyAndClose $form
+
+        $script:copying | Should Be $false
+        $form.IsDisposed | Should Be $true
     }
 }
