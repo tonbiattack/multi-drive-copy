@@ -290,6 +290,413 @@ function Get-FileSha256 {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
 }
 
+function Get-PathKey {
+    param([string]$Path)
+    $full = [IO.Path]::GetFullPath([string]$Path)
+    if ($full.Length -gt 3) { $full = $full.TrimEnd('\') }
+    return $full.ToLowerInvariant()
+}
+
+function Test-SourceOverlap {
+    param([string[]]$Sources)
+
+    $entries = New-Object System.Collections.ArrayList
+    foreach ($source in @($Sources)) {
+        if (-not $source) { continue }
+        try { $item = Get-Item -LiteralPath $source -ErrorAction Stop } catch { continue }
+        $full = [string]$item.FullName
+        if ($full.Length -gt 3) { $full = $full.TrimEnd('\') }
+        [void]$entries.Add([pscustomobject]@{
+            Path = $full
+            Key = $full.ToLowerInvariant()
+            IsDirectory = $item.PSIsContainer
+        })
+    }
+    for ($i = 0; $i -lt $entries.Count; $i++) {
+        for ($j = $i + 1; $j -lt $entries.Count; $j++) {
+            $first = $entries[$i]
+            $second = $entries[$j]
+            $firstPrefix = if ($first.Key.EndsWith('\')) { $first.Key } else { $first.Key + '\' }
+            $secondPrefix = if ($second.Key.EndsWith('\')) { $second.Key } else { $second.Key + '\' }
+            if ($first.IsDirectory -and ($second.Key -eq $first.Key -or $second.Key.StartsWith($firstPrefix, [StringComparison]::OrdinalIgnoreCase))) {
+                return $true
+            }
+            if ($second.IsDirectory -and ($first.Key -eq $second.Key -or $first.Key.StartsWith($secondPrefix, [StringComparison]::OrdinalIgnoreCase))) {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
+function Test-SourceUnderDestination {
+    param(
+        [string[]]$Sources,
+        [string[]]$Destinations
+    )
+
+    $destinationKeys = @()
+    foreach ($destination in @($Destinations)) {
+        if (-not $destination) { continue }
+        $key = Get-PathKey $destination
+        $prefix = if ($key.EndsWith('\')) { $key } else { $key + '\' }
+        $destinationKeys += [pscustomobject]@{ Key = $key; Prefix = $prefix }
+    }
+    foreach ($source in @($Sources)) {
+        if (-not $source) { continue }
+        $sourceKey = Get-PathKey $source
+        $sourcePrefix = if ($sourceKey.EndsWith('\')) { $sourceKey } else { $sourceKey + '\' }
+        foreach ($destination in $destinationKeys) {
+            if ($sourceKey -eq $destination.Key -or $sourceKey.StartsWith($destination.Prefix, [StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+            if ($destination.Key.StartsWith($sourcePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
+function Get-SourceTree {
+    param([string]$Root)
+
+    $directories = New-Object System.Collections.ArrayList
+    $files = New-Object System.Collections.ArrayList
+    $unsafe = $false
+    if (-not [IO.Directory]::Exists($Root)) {
+        return @{ Directories = $directories; Files = $files; Unsafe = $true }
+    }
+    try {
+        $rootInfo = Get-Item -LiteralPath $Root -Force -ErrorAction Stop
+        if ($rootInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            return @{ Directories = $directories; Files = $files; Unsafe = $true }
+        }
+        $stack = New-Object System.Collections.Stack
+        $stack.Push([string]$Root)
+        while ($stack.Count -gt 0) {
+            $directory = [string]$stack.Pop()
+            [void]$directories.Add($directory)
+            try {
+                $entries = [IO.Directory]::EnumerateFileSystemEntries($directory)
+            } catch {
+                $unsafe = $true
+                continue
+            }
+            foreach ($entry in $entries) {
+                try {
+                    $info = Get-Item -LiteralPath $entry -Force -ErrorAction Stop
+                } catch {
+                    $unsafe = $true
+                    continue
+                }
+                if ($info.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                    $unsafe = $true
+                    continue
+                }
+                if ($info.PSIsContainer) { $stack.Push([string]$entry) }
+                else { [void]$files.Add([string]$entry) }
+            }
+        }
+    } catch {
+        $unsafe = $true
+    }
+    return @{ Directories = $directories; Files = $files; Unsafe = $unsafe }
+}
+
+function Get-FolderVerification {
+    param(
+        [string[]]$SourceFolders,
+        [object[]]$FileResults,
+        [object[]]$DirectoryMap,
+        [int]$DestinationCount,
+        [scriptblock]$OnProgress
+    )
+
+    $results = New-Object System.Collections.ArrayList
+    $seen = @{}
+    $index = 0
+    foreach ($folder in @($SourceFolders)) {
+        if (-not $folder) { continue }
+        $folderKey = Get-PathKey $folder
+        if ($seen.ContainsKey($folderKey)) { continue }
+        $seen[$folderKey] = $true
+        $index++
+        if ($OnProgress) { & $OnProgress $index $folder }
+
+        $result = [pscustomobject]@{
+            Kind = 'Folder'
+            Source = [string]$folder
+            Size = 0
+            SourceHash = ''
+            Destinations = @()
+            Action = ''
+            Status = 'Protected'
+            Reason = ''
+            FileCount = 0
+            DirectoryCount = 0
+            Children = @()
+            Directories = @()
+            DestinationCount = $DestinationCount
+        }
+        try {
+            if (-not [IO.Directory]::Exists($folder)) {
+                $result.Reason = 'コピー元フォルダが見つかりません'
+                [void]$results.Add($result)
+                continue
+            }
+            $tree = Get-SourceTree $folder
+            if ($tree.Unsafe) {
+                $result.Reason = 'ジャンクションまたはシンボリックリンクが含まれているため移動できません'
+                [void]$results.Add($result)
+                continue
+            }
+
+            $currentDirs = @($tree.Directories | ForEach-Object { [string]$_ })
+            $currentDirKeys = @{}
+            foreach ($directory in $currentDirs) { $currentDirKeys[(Get-PathKey $directory)] = $true }
+            $result.DirectoryCount = $currentDirs.Count
+
+            $dirRows = New-Object System.Collections.ArrayList
+            $dirsOk = $true
+            foreach ($directory in $currentDirs) {
+                $rows = @($DirectoryMap | Where-Object { (Get-PathKey ([string]$_.Source)) -eq (Get-PathKey $directory) })
+                $destinations = New-Object System.Collections.ArrayList
+                $destinationSeen = @{}
+                $actions = New-Object System.Collections.ArrayList
+                foreach ($row in $rows) {
+                    $destination = [string]$row.Destination
+                    $destinationKey = Get-PathKey $destination
+                    if (-not $destinationSeen.ContainsKey($destinationKey)) {
+                        $destinationSeen[$destinationKey] = $true
+                        [void]$destinations.Add($destination)
+                    }
+                    if ($row.Action -and -not $actions.Contains([string]$row.Action)) {
+                        [void]$actions.Add([string]$row.Action)
+                    }
+                }
+                if ($destinations.Count -ne $DestinationCount) {
+                    $result.Reason = 'ディレクトリのコピー先が不足しています: ' + $directory
+                    $dirsOk = $false
+                    break
+                }
+                foreach ($destination in $destinations) {
+                    if (-not [IO.Directory]::Exists($destination)) {
+                        $result.Reason = 'コピー先ディレクトリが見つかりません: ' + $destination
+                        $dirsOk = $false
+                        break
+                    }
+                }
+                if (-not $dirsOk) { break }
+                [void]$dirRows.Add([pscustomobject]@{
+                    Source = $directory
+                    Destinations = @($destinations)
+                    Action = ($actions -join ', ')
+                })
+            }
+            if (-not $dirsOk) {
+                [void]$results.Add($result)
+                continue
+            }
+
+            $folderPrefix = $folder.TrimEnd('\') + '\'
+            foreach ($row in $DirectoryMap) {
+                $rowSource = [string]$row.Source
+                if ($rowSource -eq $folder -or $rowSource.StartsWith($folderPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                    if (-not $currentDirKeys.ContainsKey((Get-PathKey $rowSource))) {
+                        $result.Reason = 'コピー後に削除・変更されたディレクトリがあります: ' + $rowSource
+                        $dirsOk = $false
+                        break
+                    }
+                }
+            }
+            if (-not $dirsOk) {
+                [void]$results.Add($result)
+                continue
+            }
+
+            $currentFiles = @($tree.Files | ForEach-Object { [string]$_ })
+            $currentFileKeys = @{}
+            foreach ($file in $currentFiles) { $currentFileKeys[(Get-PathKey $file)] = $true }
+            $result.FileCount = $currentFiles.Count
+            $children = New-Object System.Collections.ArrayList
+            $totalSize = 0
+            $filesOk = $true
+            foreach ($file in $currentFiles) {
+                $fileResult = @($FileResults | Where-Object { (Get-PathKey ([string]$_.Source)) -eq (Get-PathKey $file) }) | Select-Object -First 1
+                if (-not $fileResult) {
+                    $result.Reason = '検証結果のないファイルがあります: ' + $file
+                    $filesOk = $false
+                    break
+                }
+                if ($fileResult.Status -ne 'Verified') {
+                    $result.Reason = 'ファイル検証に失敗しました: ' + $file + ' (' + $fileResult.Status + ')'
+                    $filesOk = $false
+                    break
+                }
+                [void]$children.Add($fileResult)
+                $totalSize += [double]$fileResult.Size
+            }
+            if ($filesOk) {
+                foreach ($fileResult in @($FileResults)) {
+                    $fileSource = [string]$fileResult.Source
+                    if ($fileSource.StartsWith($folderPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                        if (-not $currentFileKeys.ContainsKey((Get-PathKey $fileSource))) {
+                            $result.Reason = 'コピー後に削除・変更されたファイルがあります: ' + $fileSource
+                            $filesOk = $false
+                            break
+                        }
+                    }
+                }
+            }
+            if (-not $filesOk) {
+                [void]$results.Add($result)
+                continue
+            }
+
+            $rootRow = @($dirRows | Where-Object { (Get-PathKey ([string]$_.Source)) -eq $folderKey }) | Select-Object -First 1
+            if (-not $rootRow) {
+                $result.Reason = 'フォルダ自身のコピー先がありません'
+                [void]$results.Add($result)
+                continue
+            }
+
+            $result.Children = @($children)
+            $result.Directories = @($dirRows)
+            $result.Size = $totalSize
+            $result.FileCount = $children.Count
+            $result.DirectoryCount = $dirRows.Count
+            $result.Destinations = @($rootRow.Destinations)
+            $result.Action = [string]$rootRow.Action
+            $result.Status = 'Verified'
+        } catch {
+            $result.Status = 'Protected'
+            $result.Reason = $_.Exception.Message
+        }
+        [void]$results.Add($result)
+    }
+    return @($results)
+}
+
+function Test-FolderResultStillValid {
+    param($Result)
+
+    try {
+        if (-not [IO.Directory]::Exists($Result.Source)) { return $false }
+        $tree = Get-SourceTree $Result.Source
+        if ($tree.Unsafe) { return $false }
+
+        $currentDirs = @{}
+        foreach ($directory in @($tree.Directories)) { $currentDirs[(Get-PathKey ([string]$directory))] = $true }
+        $recordedDirs = @($Result.Directories)
+        if ($currentDirs.Count -ne $recordedDirs.Count) { return $false }
+        foreach ($dirRow in $recordedDirs) {
+            if (-not $currentDirs.ContainsKey((Get-PathKey ([string]$dirRow.Source)))) { return $false }
+            if (-not [IO.Directory]::Exists([string]$dirRow.Source)) { return $false }
+            if (@($dirRow.Destinations).Count -ne $Result.DestinationCount) { return $false }
+            foreach ($destination in @($dirRow.Destinations)) {
+                if (-not [IO.Directory]::Exists([string]$destination)) { return $false }
+            }
+        }
+
+        $currentFiles = @{}
+        foreach ($file in @($tree.Files)) { $currentFiles[(Get-PathKey ([string]$file))] = $true }
+        $children = @($Result.Children)
+        if ($currentFiles.Count -ne $children.Count) { return $false }
+        foreach ($child in $children) {
+            if (-not $currentFiles.ContainsKey((Get-PathKey ([string]$child.Source)))) { return $false }
+            if (-not (Test-VerifiedResultStillValid $child)) { return $false }
+        }
+
+        if (@($Result.Destinations).Count -ne $Result.DestinationCount) { return $false }
+        foreach ($destination in @($Result.Destinations)) {
+            if (-not [IO.Directory]::Exists([string]$destination)) { return $false }
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Move-VerifiedFolderToRecycleBin {
+    param($Result)
+
+    try { Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop } catch {}
+    if (-not (Test-FolderResultStillValid $Result)) {
+        $Result.Status = 'Changed'
+        $Result.Reason = '検証後にコピー元フォルダまたはコピー先が変更されました'
+        return 'Changed'
+    }
+    try {
+        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory(
+            $Result.Source,
+            [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+            [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
+        )
+        $Result.Status = 'Moved'
+        $Result.Reason = 'フォルダをごみ箱へ移動しました'
+        foreach ($child in @($Result.Children)) {
+            $child.Status = 'Moved'
+            $child.Reason = 'フォルダと一緒にごみ箱へ移動しました'
+        }
+        return 'Moved'
+    } catch {
+        $Result.Status = 'MoveFailed'
+        $Result.Reason = 'ごみ箱へ移動できませんでした: ' + $_.Exception.Message
+        return 'Failed'
+    }
+}
+
+function Move-VerifiedItemsToRecycleBin {
+    param(
+        [object[]]$Results,
+        [scriptblock]$OnProgress
+    )
+
+    try { Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop } catch {}
+    $folderCandidates = @($Results | Where-Object { $_.Kind -eq 'Folder' } | ForEach-Object { [string]$_.Source })
+    $ordered = @($Results | Sort-Object @{ Expression = { if ($_.Kind -eq 'Folder') { 0 } else { 1 } } }, @{ Expression = { ([string]$_.Source).Length } })
+    $moved = 0
+    $failed = 0
+    $changed = 0
+    $index = 0
+    foreach ($result in $ordered) {
+        if ($result.Status -ne 'Verified') { continue }
+        $index++
+        if ($OnProgress) { & $OnProgress $index $result.Source }
+
+        $insideFolder = $false
+        foreach ($folder in $folderCandidates) {
+            if ([string]$folder -eq [string]$result.Source) { continue }
+            $prefix = $folder.TrimEnd('\') + '\'
+            if (([string]$result.Source).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+                $insideFolder = $true
+                break
+            }
+        }
+        if ($insideFolder) {
+            $result.Status = 'Protected'
+            $result.Reason = '親フォルダと一緒に扱うため個別移動しません'
+            continue
+        }
+
+        if ($result.Kind -eq 'Folder') {
+            switch (Move-VerifiedFolderToRecycleBin $result) {
+                'Moved' { $moved++ }
+                'Changed' { $changed++ }
+                'Failed' { $failed++ }
+            }
+        } else {
+            switch (Move-VerifiedFileToRecycleBin $result) {
+                'Moved' { $moved++ }
+                'Changed' { $changed++ }
+                'Failed' { $failed++ }
+            }
+        }
+    }
+    return @{ Moved = $moved; Failed = $failed; Changed = $changed }
+}
+
 function Get-CopyVerification {
     param(
         [string[]]$SourceFiles,
@@ -309,6 +716,7 @@ function Get-CopyVerification {
         if ($OnProgress) { & $OnProgress $index $source }
 
         $result = [pscustomobject]@{
+            Kind = 'File'
             Source = [string]$source
             Size = 0
             SourceHash = ''
@@ -324,6 +732,11 @@ function Get-CopyVerification {
                 continue
             }
             $sourceInfo = Get-Item -LiteralPath $source
+            if ($sourceInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                $result.Reason = 'シンボリックリンク等の再解析ポイントは移動できません'
+                [void]$results.Add($result)
+                continue
+            }
             $result.Size = $sourceInfo.Length
             $result.SourceHash = Get-FileSha256 $source
 
@@ -406,44 +819,29 @@ function Test-VerifiedResultStillValid {
     }
 }
 
-function Move-VerifiedFilesToRecycleBin {
-    param(
-        [object[]]$Results,
-        [scriptblock]$OnProgress
-    )
+function Move-VerifiedFileToRecycleBin {
+    param($Result)
 
     try { Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop } catch {}
-    $moved = 0
-    $failed = 0
-    $changed = 0
-    $index = 0
-    foreach ($result in @($Results)) {
-        if ($result.Status -ne 'Verified') { continue }
-        $index++
-        if ($OnProgress) { & $OnProgress $index $result.Source }
-
-        if (-not (Test-VerifiedResultStillValid $result)) {
-            $result.Status = 'Changed'
-            $result.Reason = '検証後にコピー元またはコピー先が変更されました'
-            $changed++
-            continue
-        }
-        try {
-            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
-                $result.Source,
-                [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
-                [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
-            )
-            $result.Status = 'Moved'
-            $result.Reason = 'ごみ箱へ移動しました'
-            $moved++
-        } catch {
-            $result.Status = 'MoveFailed'
-            $result.Reason = 'ごみ箱へ移動できませんでした: ' + $_.Exception.Message
-            $failed++
-        }
+    if (-not (Test-VerifiedResultStillValid $Result)) {
+        $Result.Status = 'Changed'
+        $Result.Reason = '検証後にコピー元またはコピー先が変更されました'
+        return 'Changed'
     }
-    return @{ Moved = $moved; Failed = $failed; Changed = $changed }
+    try {
+        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
+            $Result.Source,
+            [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+            [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
+        )
+        $Result.Status = 'Moved'
+        $Result.Reason = 'ごみ箱へ移動しました'
+        return 'Moved'
+    } catch {
+        $Result.Status = 'MoveFailed'
+        $Result.Reason = 'ごみ箱へ移動できませんでした: ' + $_.Exception.Message
+        return 'Failed'
+    }
 }
 
 function Get-VerificationSummary {
@@ -483,7 +881,8 @@ function Write-VerificationLog {
     param(
         [string]$Path,
         [object[]]$Results,
-        $Summary
+        $Summary,
+        [object[]]$FileResults
     )
 
     $directory = Split-Path -Parent $Path
@@ -496,17 +895,34 @@ function Write-VerificationLog {
     [void]$builder.AppendLine('移動可能サイズ: ' + (Format-FileSize $Summary.CandidateSize))
     [void]$builder.AppendLine('')
     foreach ($result in @($Results)) {
-        [void]$builder.AppendLine('[' + $result.Status + '] ' + $result.Source)
+        $kind = if ($result.Kind -eq 'Folder') { 'フォルダ' } else { 'ファイル' }
+        [void]$builder.AppendLine('[' + $result.Status + '] [' + $kind + '] ' + $result.Source)
         [void]$builder.AppendLine('  サイズ: ' + $result.Size + ' / 操作: ' + $result.Action)
-        [void]$builder.AppendLine('  SHA-256: ' + $result.SourceHash)
+        if ($result.Kind -eq 'Folder') {
+            [void]$builder.AppendLine('  内訳: ファイル ' + $result.FileCount + ' / ディレクトリ ' + $result.DirectoryCount)
+        }
+        if ($result.SourceHash) { [void]$builder.AppendLine('  SHA-256: ' + $result.SourceHash) }
         foreach ($destination in @($result.Destinations)) {
             [void]$builder.AppendLine('  コピー先: ' + $destination)
         }
         if ($result.Reason) { [void]$builder.AppendLine('  詳細: ' + $result.Reason) }
         [void]$builder.AppendLine('')
     }
+    if (@($FileResults).Count -gt 0) {
+        [void]$builder.AppendLine('## ファイル単位の検証')
+        foreach ($result in @($FileResults)) {
+            [void]$builder.AppendLine('[' + $result.Status + '] ' + $result.Source)
+            [void]$builder.AppendLine('  サイズ: ' + $result.Size + ' / 操作: ' + $result.Action)
+            [void]$builder.AppendLine('  SHA-256: ' + $result.SourceHash)
+            foreach ($destination in @($result.Destinations)) {
+                [void]$builder.AppendLine('  コピー先: ' + $destination)
+            }
+            if ($result.Reason) { [void]$builder.AppendLine('  詳細: ' + $result.Reason) }
+            [void]$builder.AppendLine('')
+        }
+    }
     [void]$builder.AppendLine('リトライ手順:')
-    [void]$builder.AppendLine('- 検証できなかったファイルと不一致のファイルはコピー元に残しています。')
+    [void]$builder.AppendLine('- 検証できなかったファイル/フォルダと不一致のファイル/フォルダはコピー元に残しています。')
     [void]$builder.AppendLine('- 移動に失敗した場合はごみ箱が利用できることを確認し、もう一度コピーと検証を実行してください。')
     [void]$builder.AppendLine('- ごみ箱が利用できない環境では完全削除に切り替えず、手動で確認してください。')
     [IO.File]::WriteAllText($Path, $builder.ToString(), (New-Object Text.UTF8Encoding($true)))

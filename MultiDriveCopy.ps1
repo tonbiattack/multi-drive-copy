@@ -24,6 +24,7 @@ $script:totalWork=0
 $script:completedWork=0
 $script:sourceFiles=@()
 $script:copyMap=$null
+$script:copyDirMap=$null
 $script:lastPreset=$null
 $script:progressBar=$null
 $script:statusLabel=$null
@@ -149,6 +150,11 @@ function Add-CopyMapping($Source,$Destination,$Action){
     if(-not $script:copyMap){$script:copyMap=New-Object System.Collections.ArrayList}
     [void]$script:copyMap.Add([pscustomobject]@{Source=[string]$Source;Destination=[string]$Destination;Action=[string]$Action})
 }
+# Records the real destination folder so empty folders and structure can be verified.
+function Add-CopyDirMapping($Source,$Destination,$Action){
+    if(-not $script:copyDirMap){$script:copyDirMap=New-Object System.Collections.ArrayList}
+    [void]$script:copyDirMap.Add([pscustomobject]@{Source=[string]$Source;Destination=[string]$Destination;Action=[string]$Action})
+}
 # Copies one file and resolves a file or directory collision before writing.
 function CopyFile($src,$dest){
     if($script:cancel){return}
@@ -173,16 +179,20 @@ function CopyFile($src,$dest){
 # Recursively merges a source directory, delegating every file collision to CopyFile.
 function CopyDir($src,$dest){
     if($script:cancel){return}
+    $action='Created'
     if([IO.File]::Exists($dest)){
         $choice=Conflict $dest
         switch($choice){
             'Skip'{$work=Get-CopyWork @($src);$script:skipped+=$work.Count;$script:completedWork+=$work.Work;Update-CopyProgress;return}
             'Cancel'{$script:cancel=$true;return}
-            'Rename'{$dest=Unique $dest}
+            'Rename'{$dest=Unique $dest;$action='Renamed'}
             'Overwrite'{throw '同名ファイルをフォルダで上書きできません: '+$dest}
         }
+    } elseif([IO.Directory]::Exists($dest)){
+        $action='Merged'
     }
     New-Item -ItemType Directory -Path $dest -Force|Out-Null
+    Add-CopyDirMapping $src $dest $action
     foreach($entry in [IO.Directory]::EnumerateFileSystemEntries($src)){
         if($script:cancel){break}
         $target=Join-Path $dest ([IO.Path]::GetFileName($entry))
@@ -196,6 +206,7 @@ function Start-CopyOperation([string[]]$Sources,[string[]]$Destinations){
     $work=Get-CopyWork $Sources
     $script:sourceFiles=@($work.Files)
     $script:copyMap=New-Object System.Collections.ArrayList
+    $script:copyDirMap=New-Object System.Collections.ArrayList
     $script:total=$work.Count*$Destinations.Count;$script:totalWork=$work.Work*$Destinations.Count;$script:completedWork=0
     if($script:progressBar){$script:progressBar.Maximum=1000;$script:progressBar.Value=0}
     Update-CopyProgress
@@ -246,6 +257,8 @@ function Get-CopyActionLabel([string]$Action){
         'Skipped'{return 'スキップ'}
         'Renamed'{return '別名保存'}
         'Overwritten'{return '上書き'}
+        'Created'{return '新規作成'}
+        'Merged'{return '統合'}
         default{return $Action}
     }
 }
@@ -257,10 +270,12 @@ function Format-VerificationDetails([object[]]$Results){
     foreach($result in $items){
         if($shown -ge $limit){break}
         $shown++
-        [void]$builder.AppendLine('['+(Get-VerificationStatusLabel $result.Status)+'] '+$result.Source)
+        $kindLabel=if($result.Kind -eq 'Folder'){'フォルダ'}else{'ファイル'}
+        [void]$builder.AppendLine('['+(Get-VerificationStatusLabel $result.Status)+'] ['+$kindLabel+'] '+$result.Source)
         $actionText=''
         if($result.Action){$actionText=@($result.Action -split ', '|Where-Object {$_}|ForEach-Object {Get-CopyActionLabel $_}) -join ', '}
         [void]$builder.AppendLine('  サイズ: '+(Format-FileSize $result.Size)+' / 操作: '+$actionText)
+        if($result.Kind -eq 'Folder'){[void]$builder.AppendLine('  内訳: ファイル '+$result.FileCount+' / ディレクトリ '+$result.DirectoryCount)}
         foreach($destination in @($result.Destinations)){[void]$builder.AppendLine('  コピー先: '+$destination)}
         if($result.Reason){[void]$builder.AppendLine('  詳細: '+$result.Reason)}
         [void]$builder.AppendLine('')
@@ -279,14 +294,15 @@ function Update-VerificationResultView {
     $script:verificationMoveButton.Text='検証済み '+$summary.Verified+' 件をごみ箱へ移動'
     $script:verificationMoveButton.Enabled=($summary.Verified -gt 0)
     try{
-        Write-VerificationLog -Path $script:verificationLogPath -Results $script:verificationResults -Summary $summary
+        Write-VerificationLog -Path $script:verificationLogPath -Results $script:verificationResults -Summary $summary -FileResults $script:verificationFileResults
         $script:verificationLogLabel.Text='ログ: '+$script:verificationLogPath
     }catch{
         $script:verificationLogLabel.Text='ログを書き込めません: '+$_.Exception.Message
     }
 }
-function Show-VerificationResult([object[]]$Results,[string]$LogPath,[Windows.Forms.Form]$Owner){
+function Show-VerificationResult([object[]]$Results,[string]$LogPath,[Windows.Forms.Form]$Owner,[object[]]$FileResults){
     $script:verificationResults=$Results
+    $script:verificationFileResults=$FileResults
     $script:verificationLogPath=$LogPath
     $dialog=New-Object Windows.Forms.Form
     $script:verificationDialog=$dialog
@@ -328,7 +344,7 @@ function Show-VerificationResult([object[]]$Results,[string]$LogPath,[Windows.Fo
         $preview=@($candidates|Select-Object -First 10|ForEach-Object {$_.Source})
         $previewText=$preview -join [Environment]::NewLine
         if($candidates.Count -gt $preview.Count){$previewText+=[Environment]::NewLine+'ほか '+($candidates.Count-$preview.Count)+' 件'}
-        $message='検証済みのコピー元をごみ箱へ移動します。'+[Environment]::NewLine+[Environment]::NewLine+'対象: '+$candidates.Count+' 件 / '+(Format-FileSize $summary.CandidateSize)+[Environment]::NewLine+'移動先: Windowsのごみ箱（完全削除は行いません）'+[Environment]::NewLine+[Environment]::NewLine+$previewText
+        $message='検証済みのコピー元をごみ箱へ移動します。'+[Environment]::NewLine+[Environment]::NewLine+'対象: '+$candidates.Count+' 件 / '+(Format-FileSize $summary.CandidateSize)+[Environment]::NewLine+'移動先: Windowsのごみ箱（完全削除は行いません）'+[Environment]::NewLine+'フォルダの候補は配下の全ファイル・空フォルダを含めて移動します。'+[Environment]::NewLine+[Environment]::NewLine+$previewText
         if([Windows.Forms.MessageBox]::Show($message,'ごみ箱へ移動の最終確認','YesNo','Warning') -ne 'Yes'){return}
         $script:verificationMoving=$true
         $script:verificationDialog.Cursor='WaitCursor'
@@ -336,7 +352,7 @@ function Show-VerificationResult([object[]]$Results,[string]$LogPath,[Windows.Fo
         $script:verificationCloseButton.Enabled=$false
         $total=$candidates.Count
         try{
-            Move-VerifiedFilesToRecycleBin -Results $script:verificationResults -OnProgress {param($i,$path) $script:verificationSummaryLabel.Text='ごみ箱へ移動中: '+$i+' / '+$total+' 件';[Windows.Forms.Application]::DoEvents()}
+            Move-VerifiedItemsToRecycleBin -Results $script:verificationResults -OnProgress {param($i,$path) $script:verificationSummaryLabel.Text='ごみ箱へ移動中: '+$i+' / '+$total+' 件';[Windows.Forms.Application]::DoEvents()}
             $after=Get-VerificationSummary $script:verificationResults
             $resultMessage='ごみ箱への移動結果'+[Environment]::NewLine+'移動: '+$after.Moved+' 件 / 変更を検出: '+$after.Changed+' 件 / 失敗: '+$after.Failed+' 件'+[Environment]::NewLine+[Environment]::NewLine+'詳細はログを参照してください。'+[Environment]::NewLine+$script:verificationLogPath
             [Windows.Forms.MessageBox]::Show($resultMessage,'移動結果','OK','Information')|Out-Null
@@ -353,6 +369,7 @@ function Show-VerificationResult([object[]]$Results,[string]$LogPath,[Windows.Fo
     $dialog.Dispose()
     $script:verificationDialog=$null
     $script:verificationResults=$null
+    $script:verificationFileResults=$null
 }
 function Get-PresetDriveLetters([string]$Name){
     if($script:presetDrives.Contains($Name)){
@@ -568,21 +585,48 @@ $copy.Add_Click({
         Start-CopyOperation -Sources $sources -Destinations $destinations
         if($recycle.Checked -and -not $script:cancel){
             $sourceFiles=@($script:sourceFiles)
+            $selectedFolders=@($sources|Where-Object {[IO.Directory]::Exists($_)})
             $status.Text='検証中...'
             $progress.Maximum=[Math]::Max(1,$sourceFiles.Count)
             $progress.Value=0
             [Windows.Forms.Application]::DoEvents()
-            $results=@(Get-CopyVerification -SourceFiles $sourceFiles -CopyMap @($script:copyMap) -DestinationCount $destinations.Count -OnProgress {
+            $fileResults=@(Get-CopyVerification -SourceFiles $sourceFiles -CopyMap @($script:copyMap) -DestinationCount $destinations.Count -OnProgress {
                 param($i,$path)
-                $status.Text='検証中: '+$i+' / '+$sourceFiles.Count+' 件'
+                $status.Text='ファイル検証中: '+$i+' / '+$sourceFiles.Count+' 件'
                 $progress.Value=[Math]::Min($progress.Maximum,$i)
                 [Windows.Forms.Application]::DoEvents()
             })
+            $folderResults=@()
+            if($selectedFolders.Count){
+                $status.Text='フォルダ構造を検証中...'
+                [Windows.Forms.Application]::DoEvents()
+                $folderResults=@(Get-FolderVerification -SourceFolders $selectedFolders -FileResults $fileResults -DirectoryMap @($script:copyDirMap) -DestinationCount $destinations.Count -OnProgress {
+                    param($i,$path)
+                    $status.Text='フォルダ検証中: '+$i+' / '+$selectedFolders.Count+' 件'
+                    [Windows.Forms.Application]::DoEvents()
+                })
+            }
+            $topResults=New-Object System.Collections.ArrayList
+            foreach($source in $sources){
+                if([IO.Directory]::Exists($source)){
+                    $folderResult=@($folderResults|Where-Object {(Get-PathKey ([string]$_.Source)) -eq (Get-PathKey $source)})|Select-Object -First 1
+                    if($folderResult){[void]$topResults.Add($folderResult)}
+                } else {
+                    $fileResult=@($fileResults|Where-Object {(Get-PathKey ([string]$_.Source)) -eq (Get-PathKey $source)})|Select-Object -First 1
+                    if($fileResult){[void]$topResults.Add($fileResult)}
+                }
+            }
+            if(Test-SourceOverlap $sources){
+                foreach($item in $topResults){$item.Status='Protected';$item.Reason='コピー元が入れ子または重複しているため移動できません'}
+            } elseif(Test-SourceUnderDestination -Sources $sources -Destinations $destinations){
+                foreach($item in $topResults){$item.Status='Protected';$item.Reason='コピー元とコピー先が親子関係にあるため移動できません'}
+            }
+            $results=@($topResults)
             $logPath=Join-Path $env:APPDATA ('MultiDriveCopy\logs\verify-'+(Get-Date -Format 'yyyyMMdd-HHmmss-fff')+'.log')
             $summary=Get-VerificationSummary $results
             $status.Text='検証成功: '+$summary.Verified+' 件 / 不一致: '+$summary.Mismatch+' 件 / 保護: '+$summary.Protected+' 件'
             $progress.Value=$progress.Maximum
-            Show-VerificationResult -Results $results -LogPath $logPath -Owner $form
+            Show-VerificationResult -Results $results -LogPath $logPath -Owner $form -FileResults $fileResults
             Complete-CopyAndClose $form
         } else {
             $status.Text='コピー: '+$script:copied+' 件 / スキップ: '+$script:skipped+' 件'

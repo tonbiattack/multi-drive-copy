@@ -317,16 +317,18 @@ Describe 'copy progress behavior' {
     BeforeAll {
         Add-Type -AssemblyName System.Windows.Forms
         $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $projectRoot 'MultiDriveCopy.ps1'), [ref]$null, [ref]$null)
-        foreach ($name in @('Add-CopyMapping', 'CopyFile', 'CopyDir', 'Update-CopyProgress', 'Start-CopyOperation', 'Complete-CopyAndClose')) {
+        foreach ($name in @('Add-CopyMapping', 'Add-CopyDirMapping', 'Unique', 'CopyFile', 'CopyDir', 'Update-CopyProgress', 'Start-CopyOperation', 'Complete-CopyAndClose')) {
             $definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }.GetNewClosure(), $true)
             if ($definition) { . ([scriptblock]::Create($definition.Extent.Text)) }
         }
-        function Conflict($path) { return 'Skip' }
+        function Conflict($path) { if ($script:conflictChoice) { return [string]$script:conflictChoice }; return 'Skip' }
     }
     BeforeEach {
         $script:cancel = $false; $script:copied = 0; $script:skipped = 0
         $script:completedWork = 0; $script:totalWork = 6; $script:total = 2
         $script:copyMap = $null
+        $script:copyDirMap = $null
+        $script:conflictChoice = $null
         $script:sourceFiles = @()
         $script:progressBar = New-Object Windows.Forms.ProgressBar
         $script:progressBar.Maximum = 1000
@@ -394,5 +396,252 @@ Describe 'copy progress behavior' {
 
         $script:copying | Should Be $false
         $form.IsDisposed | Should Be $true
+    }
+}
+
+Describe 'folder verification behavior' {
+    BeforeAll {
+        Add-Type -AssemblyName System.Windows.Forms
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $projectRoot 'MultiDriveCopy.ps1'), [ref]$null, [ref]$null)
+        foreach ($name in @('Add-CopyMapping', 'Add-CopyDirMapping', 'Unique', 'CopyFile', 'CopyDir', 'Update-CopyProgress', 'Start-CopyOperation', 'Complete-CopyAndClose')) {
+            $definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }.GetNewClosure(), $true)
+            if ($definition) { . ([scriptblock]::Create($definition.Extent.Text)) }
+        }
+        function Conflict($path) { if ($script:conflictChoice) { return [string]$script:conflictChoice }; return 'Skip' }
+        function New-FolderFixture([string]$Name, [string]$Content = 'verified') {
+            $root = Join-Path $TestDrive $Name
+            $source = Join-Path $root 'source'
+            $destinations = @((Join-Path $root 'dest1'), (Join-Path $root 'dest2'))
+            New-Item -ItemType Directory -Path (Join-Path $source 'empty'), (Join-Path $source 'nested') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $source 'nested\file.txt') -Value $Content
+            return @{ Root = $root; Source = $source; Destinations = $destinations }
+        }
+        function Get-FolderResultsForFixture($Fixture) {
+            $fileResults = @(Get-CopyVerification -SourceFiles @($script:sourceFiles) -CopyMap @($script:copyMap) -DestinationCount @($Fixture.Destinations).Count)
+            $folderResults = @(Get-FolderVerification -SourceFolders @($Fixture.Source) -FileResults $fileResults -DirectoryMap @($script:copyDirMap) -DestinationCount @($Fixture.Destinations).Count)
+            return @{ FileResults = $fileResults; FolderResults = $folderResults }
+        }
+    }
+    BeforeEach {
+        $script:cancel = $false; $script:copied = 0; $script:skipped = 0
+        $script:completedWork = 0; $script:totalWork = 6; $script:total = 2
+        $script:copyMap = $null
+        $script:copyDirMap = $null
+        $script:conflictChoice = $null
+        $script:sourceFiles = @()
+        $script:progressBar = New-Object Windows.Forms.ProgressBar
+        $script:progressBar.Maximum = 1000
+        $script:statusLabel = New-Object Windows.Forms.Label
+    }
+
+    It 'records directory mappings including empty folders' {
+        $root = Join-Path $TestDrive 'mapping-source'
+        $source = Join-Path $root 'source'
+        $destination = Join-Path $root 'destination'
+        New-Item -ItemType Directory -Path (Join-Path $source 'empty'), (Join-Path $source 'nested') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $source 'nested\file.txt') -Value 'data'
+
+        CopyDir $source $destination
+
+        @($script:copyDirMap).Count | Should Be 3
+        $emptyRow = @($script:copyDirMap | Where-Object { $_.Source -eq (Join-Path $source 'empty') })
+        $emptyRow.Count | Should Be 1
+        $emptyRow[0].Destination | Should Be (Join-Path $destination 'empty')
+    }
+
+    It 'verifies a folder when files and empty folders exist at every destination' {
+        $fixture = New-FolderFixture 'verified-folder'
+        Start-CopyOperation @($fixture.Source) $fixture.Destinations
+        $results = Get-FolderResultsForFixture $fixture
+
+        $results.FolderResults[0].Status | Should Be 'Verified'
+        $results.FolderResults[0].FileCount | Should Be 1
+        $results.FolderResults[0].DirectoryCount | Should Be 3
+        @($results.FolderResults[0].Destinations).Count | Should Be 2
+        (Test-FolderResultStillValid $results.FolderResults[0]) | Should Be $true
+    }
+
+    It 'verifies an empty folder against every destination' {
+        $root = Join-Path $TestDrive 'empty-folder'
+        $source = Join-Path $root 'source'
+        $destinations = @((Join-Path $root 'dest1'), (Join-Path $root 'dest2'))
+        New-Item -ItemType Directory -Path $source -Force | Out-Null
+        Start-CopyOperation @($source) $destinations
+        $fixture = @{ Source = $source; Destinations = $destinations }
+        $results = Get-FolderResultsForFixture $fixture
+
+        $results.FolderResults[0].Status | Should Be 'Verified'
+        $results.FolderResults[0].FileCount | Should Be 0
+        $results.FolderResults[0].DirectoryCount | Should Be 1
+    }
+
+    It 'protects a folder when an empty directory is missing at a destination' {
+        $fixture = New-FolderFixture 'missing-empty-dir'
+        Start-CopyOperation @($fixture.Source) $fixture.Destinations
+        Remove-Item -LiteralPath (Join-Path (Join-Path $fixture.Destinations[1] 'source') 'empty') -Force
+        $results = Get-FolderResultsForFixture $fixture
+
+        $results.FolderResults[0].Status | Should Be 'Protected'
+        $results.FolderResults[0].Reason | Should Match 'コピー先ディレクトリ'
+    }
+
+    It 'protects a folder when a destination file differs' {
+        $fixture = New-FolderFixture 'mismatch-folder'
+        Start-CopyOperation @($fixture.Source) $fixture.Destinations
+        Set-Content -LiteralPath (Join-Path (Join-Path $fixture.Destinations[0] 'source') 'nested\file.txt') -Value 'tampered'
+        $results = Get-FolderResultsForFixture $fixture
+
+        $results.FolderResults[0].Status | Should Be 'Protected'
+        $results.FolderResults[0].Reason | Should Match 'ファイル検証に失敗'
+    }
+
+    It 'protects a folder when a file was added to the source after copy' {
+        $fixture = New-FolderFixture 'added-source-file'
+        Start-CopyOperation @($fixture.Source) $fixture.Destinations
+        Set-Content -LiteralPath (Join-Path $fixture.Source 'added.txt') -Value 'new'
+        $results = Get-FolderResultsForFixture $fixture
+
+        $results.FolderResults[0].Status | Should Be 'Protected'
+        $results.FolderResults[0].Reason | Should Match '検証結果のないファイル'
+    }
+
+    It 'protects a folder when a source file was deleted after copy' {
+        $fixture = New-FolderFixture 'deleted-source-file'
+        Start-CopyOperation @($fixture.Source) $fixture.Destinations
+        Remove-Item -LiteralPath (Join-Path $fixture.Source 'nested\file.txt') -Force
+        $results = Get-FolderResultsForFixture $fixture
+
+        $results.FolderResults[0].Status | Should Be 'Protected'
+        $results.FolderResults[0].Reason | Should Match '削除・変更されたファイル'
+    }
+
+    It 'follows a renamed destination folder during verification' {
+        $root = Join-Path $TestDrive 'renamed-folder'
+        $source = Join-Path $root 'source'
+        $destinationRoot = Join-Path $root 'destination'
+        New-Item -ItemType Directory -Path $source, $destinationRoot -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $source 'file.txt') -Value 'renamed'
+        Set-Content -LiteralPath (Join-Path $destinationRoot 'source') -Value 'conflict'
+        $script:conflictChoice = 'Rename'
+
+        Start-CopyOperation @($source) @($destinationRoot)
+        $fileResults = @(Get-CopyVerification -SourceFiles @($script:sourceFiles) -CopyMap @($script:copyMap) -DestinationCount 1)
+        $folderResults = @(Get-FolderVerification -SourceFolders @($source) -FileResults $fileResults -DirectoryMap @($script:copyDirMap) -DestinationCount 1)
+
+        $folderResults[0].Status | Should Be 'Verified'
+        $folderResults[0].Destinations[0] | Should Match 'source \(1\)$'
+        (Test-FolderResultStillValid $folderResults[0]) | Should Be $true
+    }
+
+    It 'accepts a skipped file only when its existing destination matches' {
+        $root = Join-Path $TestDrive 'skipped-folder'
+        $source = Join-Path $root 'source'
+        $destinationRoot = Join-Path $root 'destination'
+        New-Item -ItemType Directory -Path (Join-Path $source 'nested') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $source 'nested\file.txt') -Value 'same'
+        New-Item -ItemType Directory -Path (Join-Path $destinationRoot 'source\nested') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $destinationRoot 'source\nested\file.txt') -Value 'same'
+        $script:conflictChoice = 'Skip'
+
+        Start-CopyOperation @($source) @($destinationRoot)
+        $fileResults = @(Get-CopyVerification -SourceFiles @($script:sourceFiles) -CopyMap @($script:copyMap) -DestinationCount 1)
+        $folderResults = @(Get-FolderVerification -SourceFolders @($source) -FileResults $fileResults -DirectoryMap @($script:copyDirMap) -DestinationCount 1)
+
+        $folderResults[0].Status | Should Be 'Verified'
+        $fileResults[0].Action | Should Be 'Skipped'
+    }
+
+    It 'protects a folder when a skipped file differs at the destination' {
+        $root = Join-Path $TestDrive 'skipped-different-folder'
+        $source = Join-Path $root 'source'
+        $destinationRoot = Join-Path $root 'destination'
+        New-Item -ItemType Directory -Path (Join-Path $source 'nested') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $source 'nested\file.txt') -Value 'same'
+        New-Item -ItemType Directory -Path (Join-Path $destinationRoot 'source\nested') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $destinationRoot 'source\nested\file.txt') -Value 'different'
+        $script:conflictChoice = 'Skip'
+
+        Start-CopyOperation @($source) @($destinationRoot)
+        $fileResults = @(Get-CopyVerification -SourceFiles @($script:sourceFiles) -CopyMap @($script:copyMap) -DestinationCount 1)
+        $folderResults = @(Get-FolderVerification -SourceFolders @($source) -FileResults $fileResults -DirectoryMap @($script:copyDirMap) -DestinationCount 1)
+
+        $folderResults[0].Status | Should Be 'Protected'
+        $folderResults[0].Reason | Should Match 'ファイル検証に失敗'
+    }
+
+    It 'does not record folder mappings after cancellation' {
+        $root = Join-Path $TestDrive 'cancelled-folder'
+        $source = Join-Path $root 'source'
+        $destinationRoot = Join-Path $root 'destination'
+        New-Item -ItemType Directory -Path $source, $destinationRoot -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $source 'file.txt') -Value 'cancel'
+        Set-Content -LiteralPath (Join-Path $destinationRoot 'source') -Value 'conflict'
+        $script:conflictChoice = 'Cancel'
+
+        Start-CopyOperation @($source) @($destinationRoot)
+
+        $script:cancel | Should Be $true
+        @($script:copyDirMap | Where-Object { $_.Source -eq $source }).Count | Should Be 0
+    }
+
+    It 'detects nested and overlapping source selections' {
+        $parent = Join-Path $TestDrive 'overlap-parent'
+        $child = Join-Path $parent 'child'
+        $sibling = Join-Path $TestDrive 'overlap-sibling'
+        New-Item -ItemType Directory -Path $child, $sibling -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $child 'file.txt') -Value 'overlap'
+
+        (Test-SourceOverlap @($parent, $child)) | Should Be $true
+        (Test-SourceOverlap @($parent, (Join-Path $child 'file.txt'))) | Should Be $true
+        (Test-SourceOverlap @($parent, $sibling)) | Should Be $false
+    }
+
+    It 'detects parent and child relationships between sources and destinations' {
+        $sourceParent = Join-Path $TestDrive 'relation-source'
+        $destinationInside = Join-Path $sourceParent 'inside'
+        $destinationRoot = Join-Path $TestDrive 'relation-destination'
+        $sourceInside = Join-Path $destinationRoot 'child'
+        $sibling = Join-Path $TestDrive 'relation-sibling'
+        New-Item -ItemType Directory -Path $destinationInside, $destinationRoot, $sourceInside, $sibling -Force | Out-Null
+
+        (Test-SourceUnderDestination -Sources @($sourceParent) -Destinations @($destinationInside)) | Should Be $true
+        (Test-SourceUnderDestination -Sources @($sourceInside) -Destinations @($destinationRoot)) | Should Be $true
+        (Test-SourceUnderDestination -Sources @($sibling) -Destinations @($destinationRoot)) | Should Be $false
+    }
+
+    It 'marks a tree with a junction as unsafe' {
+        $source = Join-Path $TestDrive 'junction-source'
+        $target = Join-Path $TestDrive 'junction-target'
+        New-Item -ItemType Directory -Path $source, $target -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $target 'file.txt') -Value 'target'
+        $link = Join-Path $source 'link'
+        New-Item -ItemType Junction -Path $link -Target $target | Out-Null
+        try {
+            $tree = Get-SourceTree $source
+            $tree.Unsafe | Should Be $true
+
+            $folderResults = @(Get-FolderVerification -SourceFolders @($source) -FileResults @() -DirectoryMap @() -DestinationCount 1)
+            $folderResults[0].Status | Should Be 'Protected'
+            $folderResults[0].Reason | Should Match 'ジャンクション'
+        } finally {
+            [IO.Directory]::Delete($link)
+        }
+    }
+
+    It 'rejects a verified folder after its source or destination changes' {
+        $fixture = New-FolderFixture 'changed-folder'
+        Start-CopyOperation @($fixture.Source) $fixture.Destinations
+        $results = Get-FolderResultsForFixture $fixture
+        (Test-FolderResultStillValid $results.FolderResults[0]) | Should Be $true
+
+        Set-Content -LiteralPath (Join-Path (Join-Path $fixture.Destinations[0] 'source') 'nested\file.txt') -Value 'changed'
+        (Test-FolderResultStillValid $results.FolderResults[0]) | Should Be $false
+
+        $fixture2 = New-FolderFixture 'changed-folder-source'
+        Start-CopyOperation @($fixture2.Source) $fixture2.Destinations
+        $results2 = Get-FolderResultsForFixture $fixture2
+        (Test-FolderResultStillValid $results2.FolderResults[0]) | Should Be $true
+        Set-Content -LiteralPath (Join-Path $fixture2.Source 'added.txt') -Value 'new'
+        (Test-FolderResultStillValid $results2.FolderResults[0]) | Should Be $false
     }
 }
