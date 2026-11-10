@@ -44,4 +44,17 @@ Describe 'PowerShell 5.1 compatibility' {
 
         ($ast.ParamBlock.Attributes.Extent.Text -join ' ') | Should Match 'PositionalBinding=\$false'
     }
+
+    It 'exposes the external source list option as a named parameter' {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $scriptRoot 'MultiDriveCopy.ps1'),
+            [ref]$null,
+            [ref]$null
+        )
+        $names = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+
+        ($names -contains 'Preset') | Should Be $true
+        ($names -contains 'SourceListFile') | Should Be $true
+        ($names -contains 'Sources') | Should Be $true
+    }
 }

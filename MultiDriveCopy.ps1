@@ -1,6 +1,7 @@
 ﻿[CmdletBinding(PositionalBinding=$false)]
 param(
     [string]$Preset,
+    [string]$SourceListFile,
     [Parameter(ValueFromRemainingArguments=$true)][string[]]$Sources
 )
 $ErrorActionPreference='Stop'
@@ -62,6 +63,30 @@ if(Test-Path -LiteralPath $script:settings) {
     } catch {Alert "保存設定を読めません: $_"}
 }
 if($script:presets.Count -eq 0){$script:presets['既定 (Backup)']='Backup'}
+$manifestSources=@()
+if($SourceListFile){
+    if($Preset){
+        Alert '-Preset と -SourceListFile は同時に指定できません。'
+        exit 1
+    }
+    try{
+        $manifestSources=@(Read-SourceListFile $SourceListFile)
+    }catch{
+        Alert ('ソースリストを読み込めません: '+$_.Exception.Message)
+        exit 1
+    }
+}
+try{
+    $mergeResult=Merge-SourcePaths -CommandLineSources $Sources -ManifestSources $manifestSources
+    $sourceItems=@($mergeResult.Sources)
+}catch{
+    Alert ('コピー元の検証に失敗しました: '+$_.Exception.Message)
+    exit 1
+}
+if($SourceListFile -and $sourceItems.Count -eq 0){
+    Alert 'ソースリストに有効なコピー元がありません。'
+    exit 1
+}
 function Button($text,$x,$y,$w){
     $b=New-Object Windows.Forms.Button
     $b.Text=$text;$b.SetBounds($x,$y,$w,30);return $b
@@ -415,23 +440,25 @@ function Invoke-PresetCopy([string]$PresetName,[string[]]$Sources){
     }
 }
 if($Preset){
-    Invoke-PresetCopy $Preset $Sources
+    Invoke-PresetCopy $Preset $sourceItems
     return
 }
 $form=New-Object Windows.Forms.Form
 $form.Text='Multi Drive Copy - E / F / G'
+if($SourceListFile){$form.Text='Multi Drive Copy - ソースリスト確認'}
 $form.StartPosition='CenterScreen'
 $form.Size=New-Object Drawing.Size(720,600)
 $form.KeyPreview=$true
 $form.Add_FormClosing({if($script:copying){$_.Cancel=$true}})
 $label=New-Object Windows.Forms.Label
-$label.Text='コピー元（右クリック → 送る で選んだ項目）'
+if($SourceListFile){$label.Text='コピー元（外部アプリから受け取ったソースリスト）'}
+else{$label.Text='コピー元（右クリック → 送る で選んだ項目）'}
 $label.SetBounds(15,15,670,22)
 $form.Controls.Add($label)
 $list=New-Object Windows.Forms.ListBox
 $list.SetBounds(15,42,670,155)
 $list.HorizontalScrollbar=$true
-foreach($src in $Sources){if(Test-Path -LiteralPath $src){[void]$list.Items.Add((Get-Item -LiteralPath $src).FullName)}}
+foreach($src in $sourceItems){[void]$list.Items.Add($src)}
 $form.Controls.Add($list)
 $label2=New-Object Windows.Forms.Label
 $label2.Text='保存済みコピー先パターン'
@@ -470,6 +497,10 @@ $recycle.Checked=$false
 $form.Controls.Add($recycle)
 $status=New-Object Windows.Forms.Label
 $status.Text='既存フォルダは統合、同名ファイルは確認します。'
+if($SourceListFile){
+    $status.Text='コピー元を '+$sourceItems.Count+' 件読み込みました。内容を確認してコピーしてください。'
+    if($mergeResult.Duplicates -gt 0){$status.Text+='（重複 '+$mergeResult.Duplicates+' 件を除外）'}
+}
 $status.SetBounds(15,435,670,30)
 $form.Controls.Add($status)
 $script:statusLabel=$status

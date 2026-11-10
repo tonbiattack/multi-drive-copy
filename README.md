@@ -32,6 +32,33 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install.ps1
 - 元データは Windows のごみ箱へ移動するため、元の場所へ復元できます。完全削除へのフォールバックは行いません。フォルダ自体は移動せず、検証済みのファイルだけを移動します。
 - 検証と移動の結果は `%APPDATA%\MultiDriveCopy\logs\verify-*.log` に記録します。
 
+## 外部アプリ連携
+
+外部アプリから大量のコピー元を渡す場合は、UTF-8 の JSON マニフェストを `-SourceListFile` で指定します。コマンドライン長の制限を避けられます。
+
+```powershell
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File "C:\path\MultiDriveCopy.ps1" -SourceListFile "C:\path\sources.json"
+```
+
+インストール済みの場合は `%LOCALAPPDATA%\Programs\MultiDriveCopy\MultiDriveCopy.ps1` を指定します。
+
+```json
+{
+  "sources": [
+    "C:\\Work\\Archive\\a.zip",
+    "C:\\Work\\Archive\\folder"
+  ]
+}
+```
+
+- `sources` は UTF-8 JSON の文字列配列で、各要素は存在するフルパス（ファイルまたはフォルダ）です。BOM の有無は問いません。
+- 起動すると設定画面が開き、読み込んだ一覧を確認してからコピーできます。自動コピーは行いません。
+- 同じパスの重複、末尾の `\` の違い、大文字小文字の違いは除外します。通常の引数と併用した場合も重複を除外します。
+- 相対パス、存在しないパス、文字列以外、`sources` 配列以外、空の一覧、不正な JSON はエラーです。理由を表示して終了コード 1 で終了します。
+- `-Preset`（プリセット直接実行）と `-SourceListFile` は同時に指定できません。
+- マニフェストは呼び出し元アプリが管理します。ユーザーが書き込める一時フォルダに適切な権限で作成し、不要になったら削除してください。MultiDriveCopy は読み取るだけで、作成・移動・削除は行いません。
+- 既存の「送る」、プリセット、競合処理、検証後のごみ箱移動はそのまま利用できます。
+
 ## アンインストール
 
 `Uninstall.ps1` を実行します。保存済みパターンは削除されません。

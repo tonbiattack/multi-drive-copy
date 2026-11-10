@@ -107,6 +107,109 @@ Describe 'copy progress helpers' {
     }
 }
 
+Describe 'source list manifests' {
+    It 'reads UTF-8 JSON with Japanese paths, spaces, and duplicate entries' {
+        $directory = Join-Path $TestDrive '連携 フォルダ'
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+        $file = Join-Path $directory 'レポート 2026.txt'
+        Set-Content -LiteralPath $file -Value 'manifest'
+        $manifestPath = Join-Path $TestDrive 'ソース リスト.json'
+        $json = @{ sources = @($file, $file.ToUpperInvariant(), ($directory + '\')) } | ConvertTo-Json -Depth 5
+        [IO.File]::WriteAllText($manifestPath, $json, (New-Object Text.UTF8Encoding($false)))
+
+        $result = @(Read-SourceListFile $manifestPath)
+
+        $result.Count | Should Be 2
+        $result[0] | Should Be $file
+        $result[1].TrimEnd('\') | Should Be $directory.TrimEnd('\')
+    }
+
+    It 'reads a UTF-8 BOM manifest and a single-item array' {
+        $file = Join-Path $TestDrive 'bom-source.txt'
+        Set-Content -LiteralPath $file -Value 'bom'
+        $manifestPath = Join-Path $TestDrive 'bom-sources.json'
+        $json = @{ sources = @($file) } | ConvertTo-Json -Depth 5
+        [IO.File]::WriteAllText($manifestPath, $json, (New-Object Text.UTF8Encoding($true)))
+
+        $result = @(Read-SourceListFile $manifestPath)
+
+        $result.Count | Should Be 1
+        $result[0] | Should Be $file
+    }
+
+    It 'reads a large manifest without losing entries' {
+        $directory = Join-Path $TestDrive 'bulk'
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+        $files = @()
+        for ($i = 1; $i -le 100; $i++) {
+            $file = Join-Path $directory ('file-{0:D3}.txt' -f $i)
+            [IO.File]::WriteAllText($file, [string]$i)
+            $files += $file
+        }
+        $manifestPath = Join-Path $TestDrive 'bulk-sources.json'
+        $json = @{ sources = $files } | ConvertTo-Json -Depth 5
+        [IO.File]::WriteAllText($manifestPath, $json, (New-Object Text.UTF8Encoding($false)))
+
+        $result = @(Read-SourceListFile $manifestPath)
+
+        $result.Count | Should Be 100
+        $result[0] | Should Be $files[0]
+        $result[99] | Should Be $files[99]
+    }
+
+    It 'rejects malformed and unsafe manifests' {
+        $invalidJson = Join-Path $TestDrive 'invalid.json'
+        Set-Content -LiteralPath $invalidJson -Value '{'
+        { Read-SourceListFile $invalidJson } | Should Throw
+
+        $missingSources = Join-Path $TestDrive 'missing-sources.json'
+        Set-Content -LiteralPath $missingSources -Value '{"items":[]}'
+        { Read-SourceListFile $missingSources } | Should Throw
+
+        $notArray = Join-Path $TestDrive 'not-array.json'
+        Set-Content -LiteralPath $notArray -Value '{"sources":"C:\\file.txt"}'
+        { Read-SourceListFile $notArray } | Should Throw
+
+        $notString = Join-Path $TestDrive 'not-string.json'
+        Set-Content -LiteralPath $notString -Value '{"sources":[123]}'
+        { Read-SourceListFile $notString } | Should Throw
+
+        $relative = Join-Path $TestDrive 'relative.json'
+        Set-Content -LiteralPath $relative -Value '{"sources":["folder\\file.txt"]}'
+        { Read-SourceListFile $relative } | Should Throw
+
+        $empty = Join-Path $TestDrive 'empty.json'
+        Set-Content -LiteralPath $empty -Value '{"sources":[]}'
+        { Read-SourceListFile $empty } | Should Throw
+
+        $missingPath = Join-Path $TestDrive 'missing-path.json'
+        $missingValue = 'C:\\mdc-missing-' + [guid]::NewGuid().ToString('N') + '.txt'
+        Set-Content -LiteralPath $missingPath -Value ('{"sources":["' + $missingValue.Replace('\', '\\') + '"]}')
+        { Read-SourceListFile $missingPath } | Should Throw
+
+        $quotedPath = Join-Path $TestDrive 'quoted.json'
+        Set-Content -LiteralPath $quotedPath -Value '{"sources":["C:\\bad\"quote.txt"]}'
+        { Read-SourceListFile $quotedPath } | Should Throw
+
+        { Read-SourceListFile (Join-Path $TestDrive 'does-not-exist.json') } | Should Throw
+    }
+
+    It 'merges command-line and manifest sources without duplicates' {
+        $commandLine = Join-Path $TestDrive 'command-line.txt'
+        $manifest = Join-Path $TestDrive 'manifest.txt'
+        $missing = Join-Path $TestDrive 'missing.txt'
+        Set-Content -LiteralPath $commandLine -Value 'command'
+        Set-Content -LiteralPath $manifest -Value 'manifest'
+
+        $result = Merge-SourcePaths -CommandLineSources @($commandLine, $missing) -ManifestSources @($commandLine.ToUpperInvariant(), $manifest)
+
+        $result.Sources.Count | Should Be 2
+        $result.Duplicates | Should Be 1
+        $result.Sources[0] | Should Be $commandLine
+        $result.Sources[1] | Should Be $manifest
+    }
+}
+
 Describe 'copy verification' {
     It 'verifies a source only when every destination matches by size and SHA-256' {
         $source = Join-Path $TestDrive 'verify-source.txt'
