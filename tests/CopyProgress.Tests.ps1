@@ -84,6 +84,17 @@ Describe 'copy progress helpers' {
         $link.TargetPath | Should Match 'powershell\.exe$'
     }
 
+    It 'returns the enumerated files for verification' {
+        $root = Join-Path $TestDrive 'work-source'
+        New-Item -ItemType Directory -Path (Join-Path $root 'nested') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $root 'top.txt') -Value 'top'
+        Set-Content -LiteralPath (Join-Path $root 'nested\child.txt') -Value 'child'
+
+        $work = Get-CopyWork @($root)
+
+        @($work.Files).Count | Should Be 2
+    }
+
     It 'returns each missing destination directory once' {
         $existing = Join-Path $TestDrive 'existing'
         $missing = Join-Path $TestDrive 'new\nested'
@@ -96,11 +107,114 @@ Describe 'copy progress helpers' {
     }
 }
 
+Describe 'copy verification' {
+    It 'verifies a source only when every destination matches by size and SHA-256' {
+        $source = Join-Path $TestDrive 'verify-source.txt'
+        $first = Join-Path $TestDrive 'verify-first.txt'
+        $second = Join-Path $TestDrive 'verify-second.txt'
+        [IO.File]::WriteAllText($source, 'verified content')
+        Copy-Item -LiteralPath $source -Destination $first
+        Copy-Item -LiteralPath $source -Destination $second
+        $map = @(
+            [pscustomobject]@{ Source = $source; Destination = $first; Action = 'Copied' },
+            [pscustomobject]@{ Source = $source; Destination = $second; Action = 'Overwritten' }
+        )
+
+        $results = @(Get-CopyVerification -SourceFiles @($source) -CopyMap $map -DestinationCount 2)
+        $summary = Get-VerificationSummary $results
+
+        $results.Count | Should Be 1
+        $results[0].Status | Should Be 'Verified'
+        @($results[0].Destinations).Count | Should Be 2
+        $summary.Verified | Should Be 1
+        $summary.CandidateSize | Should Be ([IO.FileInfo]$source).Length
+    }
+
+    It 'marks a hash mismatch as not movable even when sizes are equal' {
+        $source = Join-Path $TestDrive 'mismatch-source.txt'
+        $first = Join-Path $TestDrive 'mismatch-first.txt'
+        $second = Join-Path $TestDrive 'mismatch-second.txt'
+        [IO.File]::WriteAllText($source, 'abc')
+        Copy-Item -LiteralPath $source -Destination $first
+        [IO.File]::WriteAllText($second, 'abd')
+        $map = @(
+            [pscustomobject]@{ Source = $source; Destination = $first; Action = 'Copied' },
+            [pscustomobject]@{ Source = $source; Destination = $second; Action = 'Copied' }
+        )
+
+        $results = @(Get-CopyVerification -SourceFiles @($source) -CopyMap $map -DestinationCount 2)
+
+        $results[0].Status | Should Be 'Mismatch'
+        $results[0].Reason | Should Match 'SHA-256'
+    }
+
+    It 'protects a source when a destination mapping is missing' {
+        $source = Join-Path $TestDrive 'missing-dest-source.txt'
+        $first = Join-Path $TestDrive 'missing-dest-first.txt'
+        [IO.File]::WriteAllText($source, 'content')
+        Copy-Item -LiteralPath $source -Destination $first
+        $map = @([pscustomobject]@{ Source = $source; Destination = $first; Action = 'Copied' })
+
+        $results = @(Get-CopyVerification -SourceFiles @($source) -CopyMap $map -DestinationCount 2)
+
+        $results[0].Status | Should Be 'Protected'
+        $results[0].Reason | Should Match '不足'
+    }
+
+    It 'accepts a skipped destination when the existing file already matches' {
+        $source = Join-Path $TestDrive 'skip-verify-source.txt'
+        $destination = Join-Path $TestDrive 'skip-verify-destination.txt'
+        [IO.File]::WriteAllText($source, 'same content')
+        Copy-Item -LiteralPath $source -Destination $destination
+        $map = @([pscustomobject]@{ Source = $source; Destination = $destination; Action = 'Skipped' })
+
+        $results = @(Get-CopyVerification -SourceFiles @($source) -CopyMap $map -DestinationCount 1)
+
+        $results[0].Status | Should Be 'Verified'
+        $results[0].Action | Should Be 'Skipped'
+    }
+
+    It 'rejects a source or destination that changed after verification' {
+        $source = Join-Path $TestDrive 'changed-source.txt'
+        $destination = Join-Path $TestDrive 'changed-destination.txt'
+        [IO.File]::WriteAllText($source, 'original')
+        Copy-Item -LiteralPath $source -Destination $destination
+        $map = @([pscustomobject]@{ Source = $source; Destination = $destination; Action = 'Copied' })
+        $results = @(Get-CopyVerification -SourceFiles @($source) -CopyMap $map -DestinationCount 1)
+        $results[0].Status | Should Be 'Verified'
+
+        [IO.File]::WriteAllText($source, 'changed!')
+        (Test-VerifiedResultStillValid $results[0]) | Should Be $false
+
+        [IO.File]::WriteAllText($source, 'original')
+        $results = @(Get-CopyVerification -SourceFiles @($source) -CopyMap $map -DestinationCount 1)
+        [IO.File]::WriteAllText($destination, 'tampered')
+        (Test-VerifiedResultStillValid $results[0]) | Should Be $false
+    }
+
+    It 'writes a log with hash results and retry guidance' {
+        $source = Join-Path $TestDrive 'log-source.txt'
+        $destination = Join-Path $TestDrive 'log-destination.txt'
+        $logPath = Join-Path $TestDrive 'logs\verify.log'
+        [IO.File]::WriteAllText($source, 'log content')
+        Copy-Item -LiteralPath $source -Destination $destination
+        $map = @([pscustomobject]@{ Source = $source; Destination = $destination; Action = 'Copied' })
+        $results = @(Get-CopyVerification -SourceFiles @($source) -CopyMap $map -DestinationCount 1)
+
+        Write-VerificationLog -Path $logPath -Results $results -Summary (Get-VerificationSummary $results)
+        $log = Get-Content -LiteralPath $logPath -Raw
+
+        $log | Should Match 'SHA-256'
+        $log | Should Match 'Verified'
+        $log | Should Match 'リトライ'
+    }
+}
+
 Describe 'copy progress behavior' {
     BeforeAll {
         Add-Type -AssemblyName System.Windows.Forms
         $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $projectRoot 'MultiDriveCopy.ps1'), [ref]$null, [ref]$null)
-        foreach ($name in @('CopyFile', 'CopyDir', 'Update-CopyProgress', 'Start-CopyOperation', 'Complete-CopyAndClose')) {
+        foreach ($name in @('Add-CopyMapping', 'CopyFile', 'CopyDir', 'Update-CopyProgress', 'Start-CopyOperation', 'Complete-CopyAndClose')) {
             $definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }.GetNewClosure(), $true)
             if ($definition) { . ([scriptblock]::Create($definition.Extent.Text)) }
         }
@@ -109,6 +223,8 @@ Describe 'copy progress behavior' {
     BeforeEach {
         $script:cancel = $false; $script:copied = 0; $script:skipped = 0
         $script:completedWork = 0; $script:totalWork = 6; $script:total = 2
+        $script:copyMap = $null
+        $script:sourceFiles = @()
         $script:progressBar = New-Object Windows.Forms.ProgressBar
         $script:progressBar.Maximum = 1000
         $script:statusLabel = New-Object Windows.Forms.Label
@@ -119,6 +235,9 @@ Describe 'copy progress behavior' {
         CopyFile $src $dest
         $script:skipped | Should Be 1
         $script:progressBar.Value | Should Be 500
+        @($script:copyMap).Count | Should Be 1
+        $script:copyMap[0].Action | Should Be 'Skipped'
+        $script:copyMap[0].Destination | Should Be $dest
     }
     It 'accounts for every file when a conflicting folder is skipped' {
         $src = Join-Path $TestDrive 'skip-folder'; $dest = Join-Path $TestDrive 'folder-conflict'
@@ -139,6 +258,9 @@ Describe 'copy progress behavior' {
         $script:copied | Should Be 2
         [IO.File]::ReadAllText((Join-Path $first 'shared-source.txt')) | Should Be 'shared'
         [IO.File]::ReadAllText((Join-Path $second 'shared-source.txt')) | Should Be 'shared'
+        @($script:sourceFiles).Count | Should Be 1
+        @($script:copyMap).Count | Should Be 2
+        $script:copyMap[0].Source | Should Be $src
     }
     It 'copies to multiple destinations and completes the combined progress' {
         $src = Join-Path $TestDrive 'multi-source'; $first = Join-Path $TestDrive 'first'; $second = Join-Path $TestDrive 'second'

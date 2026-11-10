@@ -21,6 +21,8 @@ $script:skipped=0
 $script:total=0
 $script:totalWork=0
 $script:completedWork=0
+$script:sourceFiles=@()
+$script:copyMap=$null
 $script:lastPreset=$null
 $script:progressBar=$null
 $script:statusLabel=$null
@@ -117,16 +119,22 @@ function Complete-CopyAndClose([Windows.Forms.Form]$CopyForm){
     $script:copying=$false
     $CopyForm.Close()
 }
+# Records the real destination used for a source file so verification can follow renames and skips.
+function Add-CopyMapping($Source,$Destination,$Action){
+    if(-not $script:copyMap){$script:copyMap=New-Object System.Collections.ArrayList}
+    [void]$script:copyMap.Add([pscustomobject]@{Source=[string]$Source;Destination=[string]$Destination;Action=[string]$Action})
+}
 # Copies one file and resolves a file or directory collision before writing.
 function CopyFile($src,$dest){
     if($script:cancel){return}
+    $action='Copied'
     if([IO.File]::Exists($dest) -or [IO.Directory]::Exists($dest)){
         $choice=Conflict $dest
         switch($choice){
-            'Skip'{$script:skipped++;$script:completedWork+=([IO.FileInfo]$src).Length+1;Update-CopyProgress;return}
+            'Skip'{$script:skipped++;$script:completedWork+=([IO.FileInfo]$src).Length+1;Add-CopyMapping $src $dest 'Skipped';Update-CopyProgress;return}
             'Cancel'{$script:cancel=$true;return}
-            'Rename'{$dest=Unique $dest}
-            'Overwrite'{if([IO.Directory]::Exists($dest)){throw '同名フォルダをファイルで上書きできません: '+$dest}}
+            'Rename'{$dest=Unique $dest;$action='Renamed'}
+            'Overwrite'{if([IO.Directory]::Exists($dest)){throw '同名フォルダをファイルで上書きできません: '+$dest};$action='Overwritten'}
         }
     }
     New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($dest)) -Force|Out-Null
@@ -134,6 +142,7 @@ function CopyFile($src,$dest){
     Copy-FileWithProgress $src $dest {param($bytes) Update-CopyProgress $bytes}
     $script:copied++
     $script:completedWork+=$fileSize+1
+    Add-CopyMapping $src $dest $action
     Update-CopyProgress
 }
 # Recursively merges a source directory, delegating every file collision to CopyFile.
@@ -160,6 +169,8 @@ function CopyDir($src,$dest){
 function Start-CopyOperation([string[]]$Sources,[string[]]$Destinations){
     $script:all=$null;$script:cancel=$false;$script:copied=0;$script:skipped=0
     $work=Get-CopyWork $Sources
+    $script:sourceFiles=@($work.Files)
+    $script:copyMap=New-Object System.Collections.ArrayList
     $script:total=$work.Count*$Destinations.Count;$script:totalWork=$work.Work*$Destinations.Count;$script:completedWork=0
     if($script:progressBar){$script:progressBar.Maximum=1000;$script:progressBar.Value=0}
     Update-CopyProgress
@@ -192,6 +203,131 @@ function Show-CopyNotification([string]$Title,[string]$Message,[string]$Level='I
         $notify.Visible=$false
         $notify.Dispose()
     }catch{}
+}
+function Get-VerificationStatusLabel([string]$Status){
+    switch($Status){
+        'Verified'{return '検証成功'}
+        'Moved'{return 'ごみ箱へ移動済み'}
+        'Mismatch'{return '不一致'}
+        'Protected'{return '保護'}
+        'Changed'{return '変更を検出'}
+        'MoveFailed'{return '移動失敗'}
+        default{return $Status}
+    }
+}
+function Get-CopyActionLabel([string]$Action){
+    switch($Action){
+        'Copied'{return 'コピー'}
+        'Skipped'{return 'スキップ'}
+        'Renamed'{return '別名保存'}
+        'Overwritten'{return '上書き'}
+        default{return $Action}
+    }
+}
+function Format-VerificationDetails([object[]]$Results){
+    $items=@($Results)
+    $limit=500
+    $builder=New-Object System.Text.StringBuilder
+    $shown=0
+    foreach($result in $items){
+        if($shown -ge $limit){break}
+        $shown++
+        [void]$builder.AppendLine('['+(Get-VerificationStatusLabel $result.Status)+'] '+$result.Source)
+        $actionText=''
+        if($result.Action){$actionText=@($result.Action -split ', '|Where-Object {$_}|ForEach-Object {Get-CopyActionLabel $_}) -join ', '}
+        [void]$builder.AppendLine('  サイズ: '+(Format-FileSize $result.Size)+' / 操作: '+$actionText)
+        foreach($destination in @($result.Destinations)){[void]$builder.AppendLine('  コピー先: '+$destination)}
+        if($result.Reason){[void]$builder.AppendLine('  詳細: '+$result.Reason)}
+        [void]$builder.AppendLine('')
+    }
+    if($items.Count -gt $limit){[void]$builder.AppendLine('... ほか '+($items.Count-$limit)+' 件。全件はログを参照してください。')}
+    return $builder.ToString()
+}
+# Recomputes verification counts and refreshes the result dialog and log.
+function Update-VerificationResultView {
+    $summary=Get-VerificationSummary $script:verificationResults
+    $text='コピー: '+$script:copied+' 件 / スキップ: '+$script:skipped+' 件'
+    $text+=[Environment]::NewLine+'検証成功（ごみ箱へ移動可能）: '+$summary.Verified+' 件 / '+(Format-FileSize $summary.CandidateSize)
+    $text+=[Environment]::NewLine+'不一致: '+$summary.Mismatch+' 件 / 保護: '+$summary.Protected+' 件 / 移動済み: '+$summary.Moved+' 件 / 変更: '+$summary.Changed+' 件 / 失敗: '+$summary.Failed+' 件'
+    $script:verificationSummaryLabel.Text=$text
+    $script:verificationDetail.Text=Format-VerificationDetails $script:verificationResults
+    $script:verificationMoveButton.Text='検証済み '+$summary.Verified+' 件をごみ箱へ移動'
+    $script:verificationMoveButton.Enabled=($summary.Verified -gt 0)
+    try{
+        Write-VerificationLog -Path $script:verificationLogPath -Results $script:verificationResults -Summary $summary
+        $script:verificationLogLabel.Text='ログ: '+$script:verificationLogPath
+    }catch{
+        $script:verificationLogLabel.Text='ログを書き込めません: '+$_.Exception.Message
+    }
+}
+function Show-VerificationResult([object[]]$Results,[string]$LogPath,[Windows.Forms.Form]$Owner){
+    $script:verificationResults=$Results
+    $script:verificationLogPath=$LogPath
+    $dialog=New-Object Windows.Forms.Form
+    $script:verificationDialog=$dialog
+    $dialog.Text='コピー結果と検証'
+    $dialog.StartPosition='CenterParent'
+    $dialog.FormBorderStyle='FixedDialog'
+    $dialog.MaximizeBox=$false
+    $dialog.MinimizeBox=$false
+    $dialog.ControlBox=$false
+    $dialog.ClientSize=New-Object Drawing.Size(860,540)
+    $script:verificationMoving=$false
+    $dialog.Add_FormClosing({if($script:verificationMoving){$_.Cancel=$true}})
+    $script:verificationSummaryLabel=New-Object Windows.Forms.Label
+    $script:verificationSummaryLabel.SetBounds(15,12,830,58)
+    $dialog.Controls.Add($script:verificationSummaryLabel)
+    $script:verificationDetail=New-Object Windows.Forms.TextBox
+    $script:verificationDetail.Multiline=$true
+    $script:verificationDetail.ReadOnly=$true
+    $script:verificationDetail.WordWrap=$false
+    $script:verificationDetail.ScrollBars='Both'
+    $script:verificationDetail.SetBounds(15,74,830,400)
+    $dialog.Controls.Add($script:verificationDetail)
+    $script:verificationLogLabel=New-Object Windows.Forms.Label
+    $script:verificationLogLabel.AutoEllipsis=$true
+    $script:verificationLogLabel.SetBounds(15,482,520,22)
+    $dialog.Controls.Add($script:verificationLogLabel)
+    $script:verificationMoveButton=Button '' 540 478 190
+    $script:verificationMoveButton.Height=30
+    $dialog.Controls.Add($script:verificationMoveButton)
+    $script:verificationCloseButton=Button '閉じる' 740 478 105
+    $script:verificationCloseButton.Height=30
+    $dialog.Controls.Add($script:verificationCloseButton)
+    Update-VerificationResultView
+    $script:verificationCloseButton.Add_Click({$script:verificationDialog.Close()})
+    $script:verificationMoveButton.Add_Click({
+        $summary=Get-VerificationSummary $script:verificationResults
+        $candidates=@($script:verificationResults|Where-Object {$_.Status -eq 'Verified'})
+        if(-not $candidates.Count){return}
+        $preview=@($candidates|Select-Object -First 10|ForEach-Object {$_.Source})
+        $previewText=$preview -join [Environment]::NewLine
+        if($candidates.Count -gt $preview.Count){$previewText+=[Environment]::NewLine+'ほか '+($candidates.Count-$preview.Count)+' 件'}
+        $message='検証済みのコピー元をごみ箱へ移動します。'+[Environment]::NewLine+[Environment]::NewLine+'対象: '+$candidates.Count+' 件 / '+(Format-FileSize $summary.CandidateSize)+[Environment]::NewLine+'移動先: Windowsのごみ箱（完全削除は行いません）'+[Environment]::NewLine+[Environment]::NewLine+$previewText
+        if([Windows.Forms.MessageBox]::Show($message,'ごみ箱へ移動の最終確認','YesNo','Warning') -ne 'Yes'){return}
+        $script:verificationMoving=$true
+        $script:verificationDialog.Cursor='WaitCursor'
+        $script:verificationMoveButton.Enabled=$false
+        $script:verificationCloseButton.Enabled=$false
+        $total=$candidates.Count
+        try{
+            Move-VerifiedFilesToRecycleBin -Results $script:verificationResults -OnProgress {param($i,$path) $script:verificationSummaryLabel.Text='ごみ箱へ移動中: '+$i+' / '+$total+' 件';[Windows.Forms.Application]::DoEvents()}
+            $after=Get-VerificationSummary $script:verificationResults
+            $resultMessage='ごみ箱への移動結果'+[Environment]::NewLine+'移動: '+$after.Moved+' 件 / 変更を検出: '+$after.Changed+' 件 / 失敗: '+$after.Failed+' 件'+[Environment]::NewLine+[Environment]::NewLine+'詳細はログを参照してください。'+[Environment]::NewLine+$script:verificationLogPath
+            [Windows.Forms.MessageBox]::Show($resultMessage,'移動結果','OK','Information')|Out-Null
+        }catch{
+            [Windows.Forms.MessageBox]::Show('移動処理でエラーが発生しました: '+$_.Exception.Message+'。コピー元は残しています。','移動エラー','OK','Error')|Out-Null
+        }finally{
+            $script:verificationMoving=$false
+            $script:verificationDialog.Cursor='Default'
+            $script:verificationCloseButton.Enabled=$true
+            Update-VerificationResultView
+        }
+    })
+    if($Owner){[void]$dialog.ShowDialog($Owner)}else{[void]$dialog.ShowDialog()}
+    $dialog.Dispose()
+    $script:verificationDialog=$null
+    $script:verificationResults=$null
 }
 function Get-PresetDriveLetters([string]$Name){
     if($script:presetDrives.Contains($Name)){
@@ -285,7 +421,7 @@ if($Preset){
 $form=New-Object Windows.Forms.Form
 $form.Text='Multi Drive Copy - E / F / G'
 $form.StartPosition='CenterScreen'
-$form.Size=New-Object Drawing.Size(720,555)
+$form.Size=New-Object Drawing.Size(720,600)
 $form.KeyPreview=$true
 $form.Add_FormClosing({if($script:copying){$_.Cancel=$true}})
 $label=New-Object Windows.Forms.Label
@@ -327,17 +463,22 @@ for($i=0;$i -lt 3;$i++){
     $drives+=,$cb
     $form.Controls.Add($cb)
 }
+$recycle=New-Object Windows.Forms.CheckBox
+$recycle.Text='コピー後、検証済みの元データをごみ箱へ移動（プリセットには保存しません）'
+$recycle.SetBounds(15,405,670,25)
+$recycle.Checked=$false
+$form.Controls.Add($recycle)
 $status=New-Object Windows.Forms.Label
 $status.Text='既存フォルダは統合、同名ファイルは確認します。'
-$status.SetBounds(15,412,670,30)
+$status.SetBounds(15,435,670,30)
 $form.Controls.Add($status)
 $script:statusLabel=$status
 $progress=New-Object Windows.Forms.ProgressBar
-$progress.SetBounds(15,442,440,18)
+$progress.SetBounds(15,468,440,18)
 $progress.Minimum=0;$progress.Maximum=1;$progress.Value=0
 $form.Controls.Add($progress)
 $script:progressBar=$progress
-$copy=Button 'コピー開始' 475 453 210
+$copy=Button 'コピー開始' 475 470 210
 $copy.Height=36
 $form.Controls.Add($copy)
 $combo.Add_SelectedIndexChanged({
@@ -387,18 +528,39 @@ $copy.Add_Click({
         $missingDirectories=@(Get-MissingDestinationDirectories $destinations)
         $question='コピー元: '+$list.Items.Count+' 項目'+[Environment]::NewLine+'コピー先: '+($destinations -join ', ')+[Environment]::NewLine+'コピーしますか？'
         if($missingDirectories.Count){$question+=[Environment]::NewLine+'新規作成するフォルダ:'+[Environment]::NewLine+($missingDirectories -join [Environment]::NewLine)}
+        if($recycle.Checked){$question+=[Environment]::NewLine+'コピー後にSHA-256で検証し、確認のうえ検証済みの元データをごみ箱へ移動します。'}
         if([Windows.Forms.MessageBox]::Show($question,'実行確認','YesNo','Question') -ne 'Yes'){return}
         foreach($directory in $missingDirectories){New-Item -ItemType Directory -Path $directory -Force|Out-Null}
         $script:copying=$true
-        foreach($control in @($list,$combo,$save,$remove,$pathbox,$copy)+$drives){$control.Enabled=$false}
+        foreach($control in @($list,$combo,$save,$remove,$pathbox,$copy,$recycle)+$drives){$control.Enabled=$false}
         $form.Cursor='WaitCursor'
         Start-CopyOperation -Sources $sources -Destinations $destinations
-        $status.Text='コピー: '+$script:copied+' 件 / スキップ: '+$script:skipped+' 件'
-        $heading=if($script:cancel){'処理を中止しました。'}else{'コピーが完了しました。'}
-        [Windows.Forms.MessageBox]::Show($heading+' '+$status.Text,'結果','OK','Information')|Out-Null
-        Complete-CopyAndClose $form
+        if($recycle.Checked -and -not $script:cancel){
+            $sourceFiles=@($script:sourceFiles)
+            $status.Text='検証中...'
+            $progress.Maximum=[Math]::Max(1,$sourceFiles.Count)
+            $progress.Value=0
+            [Windows.Forms.Application]::DoEvents()
+            $results=@(Get-CopyVerification -SourceFiles $sourceFiles -CopyMap @($script:copyMap) -DestinationCount $destinations.Count -OnProgress {
+                param($i,$path)
+                $status.Text='検証中: '+$i+' / '+$sourceFiles.Count+' 件'
+                $progress.Value=[Math]::Min($progress.Maximum,$i)
+                [Windows.Forms.Application]::DoEvents()
+            })
+            $logPath=Join-Path $env:APPDATA ('MultiDriveCopy\logs\verify-'+(Get-Date -Format 'yyyyMMdd-HHmmss-fff')+'.log')
+            $summary=Get-VerificationSummary $results
+            $status.Text='検証成功: '+$summary.Verified+' 件 / 不一致: '+$summary.Mismatch+' 件 / 保護: '+$summary.Protected+' 件'
+            $progress.Value=$progress.Maximum
+            Show-VerificationResult -Results $results -LogPath $logPath -Owner $form
+            Complete-CopyAndClose $form
+        } else {
+            $status.Text='コピー: '+$script:copied+' 件 / スキップ: '+$script:skipped+' 件'
+            $heading=if($script:cancel){'処理を中止しました。'}else{'コピーが完了しました。'}
+            [Windows.Forms.MessageBox]::Show($heading+' '+$status.Text,'結果','OK','Information')|Out-Null
+            Complete-CopyAndClose $form
+        }
     }catch{Alert ('コピーエラー: '+$_.Exception.Message+' （途中までコピーされている場合があります）')}
-    finally{$script:copying=$false;foreach($control in @($list,$combo,$save,$remove,$pathbox,$copy)+$drives){$control.Enabled=$true};$form.Cursor='Default'}
+    finally{$script:copying=$false;foreach($control in @($list,$combo,$save,$remove,$pathbox,$copy,$recycle)+$drives){$control.Enabled=$true};$form.Cursor='Default'}
 })
 $form.Add_KeyDown({
     if($_.Control -and $_.KeyCode -eq 'Enter'){$copy.PerformClick()}

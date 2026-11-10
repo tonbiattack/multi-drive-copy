@@ -2,13 +2,18 @@
     param([string[]]$Sources)
     $count = 0
     [double]$work = 0
+    $fileList = New-Object System.Collections.ArrayList
     foreach ($source in $Sources) {
         if ([IO.File]::Exists($source)) { $files = @($source) }
         elseif ([IO.Directory]::Exists($source)) { $files = [IO.Directory]::EnumerateFiles($source, '*', [IO.SearchOption]::AllDirectories) }
         else { continue }
-        foreach ($file in $files) { $count++; $work += ([IO.FileInfo]$file).Length + 1 }
+        foreach ($file in $files) {
+            $count++
+            $work += ([IO.FileInfo]$file).Length + 1
+            [void]$fileList.Add([string]$file)
+        }
     }
-    return @{ Count = $count; Work = $work }
+    return @{ Count = $count; Work = $work; Files = $fileList }
 }
 
 function Copy-FileWithProgress {
@@ -190,4 +195,231 @@ function Sync-PresetSendToShortcuts {
         $link.Description = '選択したファイル・フォルダを ' + $name + ' のコピー先へ一括コピー'
         $link.Save()
     }
+}
+
+function Get-FileSha256 {
+    param([string]$Path)
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+}
+
+function Get-CopyVerification {
+    param(
+        [string[]]$SourceFiles,
+        [object[]]$CopyMap,
+        [int]$DestinationCount,
+        [scriptblock]$OnProgress
+    )
+
+    $results = New-Object System.Collections.ArrayList
+    $seen = @{}
+    $index = 0
+    foreach ($source in @($SourceFiles)) {
+        $key = ([string]$source).ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $index++
+        if ($OnProgress) { & $OnProgress $index $source }
+
+        $result = [pscustomobject]@{
+            Source = [string]$source
+            Size = 0
+            SourceHash = ''
+            Destinations = @()
+            Action = ''
+            Status = 'Protected'
+            Reason = ''
+        }
+        try {
+            if (-not [IO.File]::Exists($source)) {
+                $result.Reason = 'コピー元が見つかりません'
+                [void]$results.Add($result)
+                continue
+            }
+            $sourceInfo = Get-Item -LiteralPath $source
+            $result.Size = $sourceInfo.Length
+            $result.SourceHash = Get-FileSha256 $source
+
+            $rows = @($CopyMap | Where-Object { [string]$_.Source -eq [string]$source })
+            $destinations = New-Object System.Collections.ArrayList
+            $destinationSeen = @{}
+            $actions = New-Object System.Collections.ArrayList
+            foreach ($row in $rows) {
+                $destination = [string]$row.Destination
+                $destinationKey = $destination.ToLowerInvariant()
+                if (-not $destinationSeen.ContainsKey($destinationKey)) {
+                    $destinationSeen[$destinationKey] = $true
+                    [void]$destinations.Add($destination)
+                }
+                if ($row.Action -and -not $actions.Contains([string]$row.Action)) {
+                    [void]$actions.Add([string]$row.Action)
+                }
+            }
+            $result.Action = ($actions -join ', ')
+
+            if ($destinations.Count -ne $DestinationCount) {
+                $result.Reason = 'コピー先の数が不足しています'
+                [void]$results.Add($result)
+                continue
+            }
+
+            $result.Destinations = @($destinations)
+            $verified = $true
+            foreach ($destination in $destinations) {
+                if (-not [IO.File]::Exists($destination)) {
+                    $verified = $false
+                    $result.Reason = 'コピー先が見つかりません: ' + $destination
+                    break
+                }
+                $destinationInfo = Get-Item -LiteralPath $destination
+                if ($destinationInfo.Length -ne $sourceInfo.Length) {
+                    $verified = $false
+                    $result.Reason = 'ファイルサイズが一致しません: ' + $destination
+                    break
+                }
+                $destinationHash = Get-FileSha256 $destination
+                if ($destinationHash -ne $result.SourceHash) {
+                    $verified = $false
+                    $result.Reason = 'SHA-256が一致しません: ' + $destination
+                    break
+                }
+            }
+            if ($verified) {
+                $result.Status = 'Verified'
+            } else {
+                $result.Status = 'Mismatch'
+            }
+        } catch {
+            $result.Status = 'Protected'
+            $result.Reason = $_.Exception.Message
+        }
+        [void]$results.Add($result)
+    }
+    return @($results)
+}
+
+function Test-VerifiedResultStillValid {
+    param($Result)
+
+    try {
+        if (-not [IO.File]::Exists($Result.Source)) { return $false }
+        $sourceInfo = Get-Item -LiteralPath $Result.Source
+        if ($sourceInfo.Length -ne $Result.Size) { return $false }
+        if ((Get-FileSha256 $Result.Source) -ne $Result.SourceHash) { return $false }
+
+        foreach ($destination in @($Result.Destinations)) {
+            if (-not [IO.File]::Exists($destination)) { return $false }
+            $destinationInfo = Get-Item -LiteralPath $destination
+            if ($destinationInfo.Length -ne $Result.Size) { return $false }
+            if ((Get-FileSha256 $destination) -ne $Result.SourceHash) { return $false }
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Move-VerifiedFilesToRecycleBin {
+    param(
+        [object[]]$Results,
+        [scriptblock]$OnProgress
+    )
+
+    try { Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop } catch {}
+    $moved = 0
+    $failed = 0
+    $changed = 0
+    $index = 0
+    foreach ($result in @($Results)) {
+        if ($result.Status -ne 'Verified') { continue }
+        $index++
+        if ($OnProgress) { & $OnProgress $index $result.Source }
+
+        if (-not (Test-VerifiedResultStillValid $result)) {
+            $result.Status = 'Changed'
+            $result.Reason = '検証後にコピー元またはコピー先が変更されました'
+            $changed++
+            continue
+        }
+        try {
+            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
+                $result.Source,
+                [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+                [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
+            )
+            $result.Status = 'Moved'
+            $result.Reason = 'ごみ箱へ移動しました'
+            $moved++
+        } catch {
+            $result.Status = 'MoveFailed'
+            $result.Reason = 'ごみ箱へ移動できませんでした: ' + $_.Exception.Message
+            $failed++
+        }
+    }
+    return @{ Moved = $moved; Failed = $failed; Changed = $changed }
+}
+
+function Get-VerificationSummary {
+    param([object[]]$Results)
+
+    if ($null -eq $Results) { $items = @() } else { $items = @($Results) }
+    $verified = @($items | Where-Object { $_.Status -eq 'Verified' })
+    $moved = @($items | Where-Object { $_.Status -eq 'Moved' })
+    $mismatch = @($items | Where-Object { $_.Status -eq 'Mismatch' })
+    $protected = @($items | Where-Object { $_.Status -eq 'Protected' })
+    $changed = @($items | Where-Object { $_.Status -eq 'Changed' })
+    $failed = @($items | Where-Object { $_.Status -eq 'MoveFailed' })
+    $candidateSize = ($verified | Measure-Object -Property Size -Sum).Sum
+    if ($null -eq $candidateSize) { $candidateSize = 0 }
+
+    return @{
+        Total = $items.Count
+        Verified = $verified.Count
+        Moved = $moved.Count
+        Mismatch = $mismatch.Count
+        Protected = $protected.Count
+        Changed = $changed.Count
+        Failed = $failed.Count
+        CandidateSize = [double]$candidateSize
+    }
+}
+
+function Format-FileSize {
+    param([double]$Bytes)
+    if ($Bytes -ge 1GB) { return ('{0:N1} GB' -f ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return ('{0:N1} MB' -f ($Bytes / 1MB)) }
+    if ($Bytes -ge 1KB) { return ('{0:N1} KB' -f ($Bytes / 1KB)) }
+    return ([string][long]$Bytes + ' B')
+}
+
+function Write-VerificationLog {
+    param(
+        [string]$Path,
+        [object[]]$Results,
+        $Summary
+    )
+
+    $directory = Split-Path -Parent $Path
+    if ($directory) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.AppendLine('Multi Drive Copy 検証ログ')
+    [void]$builder.AppendLine('生成日時: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+    [void]$builder.AppendLine('対象: ' + $Summary.Total + ' 件 / 検証成功: ' + $Summary.Verified + ' 件 / 移動済み: ' + $Summary.Moved + ' 件')
+    [void]$builder.AppendLine('不一致: ' + $Summary.Mismatch + ' 件 / 保護: ' + $Summary.Protected + ' 件 / 変更: ' + $Summary.Changed + ' 件 / 移動失敗: ' + $Summary.Failed + ' 件')
+    [void]$builder.AppendLine('移動可能サイズ: ' + (Format-FileSize $Summary.CandidateSize))
+    [void]$builder.AppendLine('')
+    foreach ($result in @($Results)) {
+        [void]$builder.AppendLine('[' + $result.Status + '] ' + $result.Source)
+        [void]$builder.AppendLine('  サイズ: ' + $result.Size + ' / 操作: ' + $result.Action)
+        [void]$builder.AppendLine('  SHA-256: ' + $result.SourceHash)
+        foreach ($destination in @($result.Destinations)) {
+            [void]$builder.AppendLine('  コピー先: ' + $destination)
+        }
+        if ($result.Reason) { [void]$builder.AppendLine('  詳細: ' + $result.Reason) }
+        [void]$builder.AppendLine('')
+    }
+    [void]$builder.AppendLine('リトライ手順:')
+    [void]$builder.AppendLine('- 検証できなかったファイルと不一致のファイルはコピー元に残しています。')
+    [void]$builder.AppendLine('- 移動に失敗した場合はごみ箱が利用できることを確認し、もう一度コピーと検証を実行してください。')
+    [void]$builder.AppendLine('- ごみ箱が利用できない環境では完全削除に切り替えず、手動で確認してください。')
+    [IO.File]::WriteAllText($Path, $builder.ToString(), (New-Object Text.UTF8Encoding($true)))
 }
