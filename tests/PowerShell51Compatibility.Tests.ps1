@@ -34,4 +34,14 @@ Describe 'PowerShell 5.1 compatibility' {
             $errors.Count | Should Be 0
         }
     }
+
+    It 'binds preset names by name so SendTo paths stay in Sources' {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $scriptRoot 'MultiDriveCopy.ps1'),
+            [ref]$null,
+            [ref]$null
+        )
+
+        ($ast.ParamBlock.Attributes.Extent.Text -join ' ') | Should Match 'PositionalBinding=\$false'
+    }
 }

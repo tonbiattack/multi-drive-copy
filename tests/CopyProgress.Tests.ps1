@@ -27,6 +27,63 @@ Describe 'copy progress helpers' {
         $settings.presets[0].name | Should Be 'Daily'
     }
 
+    It 'preserves per-preset drives without breaking older settings' {
+        $settingsPath = Join-Path $TestDrive 'presets.json'
+        Save-PresetSettings $settingsPath ([ordered]@{ Daily = 'Backup\Daily' }) 'Daily' @{ Daily = @('E', 'G') }
+
+        $settings = Get-PresetSettings $settingsPath
+        (@($settings.presets[0].drives) -join ',') | Should Be 'E,G'
+        $settings.presets[0].drives | Should Not BeNullOrEmpty
+
+        Save-PresetSettings $settingsPath ([ordered]@{ Legacy = 'Backup\Legacy' }) 'Legacy'
+        $legacy = Get-PresetSettings $settingsPath
+        $legacy.presets[0].drives | Should BeNullOrEmpty
+    }
+
+    It 'removes invalid characters from preset shortcut file names' {
+        (ConvertTo-ShortcutFileName 'A/B:C*D?E"F<G>H|I') | Should Be 'A_B_C_D_E_F_G_H_I'
+        (ConvertTo-ShortcutFileName '   ') | Should Be 'preset'
+    }
+
+    It 'resolves one destination per drive and rejects a source copied onto itself' {
+        $source = Join-Path $TestDrive 'resolved.txt'
+        Set-Content -LiteralPath $source -Value 'resolved'
+        $testRoot = $TestDrive.FullName
+        $letter = $testRoot.Substring(0, 1)
+        $relative = $testRoot.Substring(3)
+
+        $destinations = @(Resolve-CopyDestinations -Sources @($source) -RelativePath 'Temp' -DriveLetters @($letter))
+        $destinations.Count | Should Be 1
+        $destinations[0] | Should Be ($letter + ':\Temp')
+
+        { Resolve-CopyDestinations -Sources @($source) -RelativePath $relative -DriveLetters @($letter) } | Should Throw
+    }
+
+    It 'creates direct preset shortcuts and removes stale ones' {
+        $sendTo = Join-Path $TestDrive 'SendTo'
+        New-Item -ItemType Directory -Path $sendTo | Out-Null
+        $target = Join-Path $TestDrive 'MultiDriveCopy.ps1'
+        Set-Content -LiteralPath $target -Value '# test'
+        $stale = Join-Path $sendTo 'E F G に一括コピー - Stale.lnk'
+        [IO.File]::WriteAllText($stale, 'stale')
+        $presets = @(
+            [pscustomobject]@{ name = 'Daily'; path = 'Backup\Daily' },
+            [pscustomobject]@{ name = 'A/B'; path = 'Backup\AB' },
+            [pscustomobject]@{ name = 'A:B'; path = 'Backup\AB2' }
+        )
+
+        Sync-PresetSendToShortcuts -TargetScript $target -Presets $presets -SendToPath $sendTo
+
+        (Test-Path -LiteralPath $stale) | Should Be $false
+        (Test-Path -LiteralPath (Join-Path $sendTo 'E F G に一括コピー - Daily.lnk')) | Should Be $true
+        (Test-Path -LiteralPath (Join-Path $sendTo 'E F G に一括コピー - A_B.lnk')) | Should Be $true
+        (Test-Path -LiteralPath (Join-Path $sendTo 'E F G に一括コピー - A_B (2).lnk')) | Should Be $true
+        $shell = New-Object -ComObject WScript.Shell
+        $link = $shell.CreateShortcut((Join-Path $sendTo 'E F G に一括コピー - Daily.lnk'))
+        $link.Arguments | Should Match '-Preset "Daily"'
+        $link.TargetPath | Should Match 'powershell\.exe$'
+    }
+
     It 'returns each missing destination directory once' {
         $existing = Join-Path $TestDrive 'existing'
         $missing = Join-Path $TestDrive 'new\nested'
@@ -43,7 +100,7 @@ Describe 'copy progress behavior' {
     BeforeAll {
         Add-Type -AssemblyName System.Windows.Forms
         $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $projectRoot 'MultiDriveCopy.ps1'), [ref]$null, [ref]$null)
-        foreach ($name in @('CopyFile', 'CopyDir', 'Update-CopyProgress', 'Complete-CopyAndClose')) {
+        foreach ($name in @('CopyFile', 'CopyDir', 'Update-CopyProgress', 'Start-CopyOperation', 'Complete-CopyAndClose')) {
             $definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }.GetNewClosure(), $true)
             if ($definition) { . ([scriptblock]::Create($definition.Extent.Text)) }
         }
@@ -72,6 +129,16 @@ Describe 'copy progress behavior' {
         CopyDir $src $dest
         $script:skipped | Should Be 2
         $script:progressBar.Value | Should Be 1000
+    }
+    It 'copies a source to every destination through the shared operation' {
+        $src = Join-Path $TestDrive 'shared-source.txt'; $first = Join-Path $TestDrive 'shared-first'; $second = Join-Path $TestDrive 'shared-second'
+        [IO.File]::WriteAllText($src, 'shared')
+
+        Start-CopyOperation @($src) @($first, $second)
+
+        $script:copied | Should Be 2
+        [IO.File]::ReadAllText((Join-Path $first 'shared-source.txt')) | Should Be 'shared'
+        [IO.File]::ReadAllText((Join-Path $second 'shared-source.txt')) | Should Be 'shared'
     }
     It 'copies to multiple destinations and completes the combined progress' {
         $src = Join-Path $TestDrive 'multi-source'; $first = Join-Path $TestDrive 'first'; $second = Join-Path $TestDrive 'second'

@@ -1,4 +1,8 @@
-﻿param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Sources)
+﻿[CmdletBinding(PositionalBinding=$false)]
+param(
+    [string]$Preset,
+    [Parameter(ValueFromRemainingArguments=$true)][string[]]$Sources
+)
 $ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -7,7 +11,9 @@ Add-Type -AssemblyName Microsoft.VisualBasic
 . (Join-Path $PSScriptRoot 'MultiDriveCopy.Core.ps1')
 # Application state shared by the UI event handlers and copy functions.
 $script:settings=Join-Path $env:APPDATA 'MultiDriveCopy\presets.json'
+$script:scriptPath=$PSCommandPath
 $script:presets=[ordered]@{}
+$script:presetDrives=@{}
 $script:all=$null
 $script:cancel=$false
 $script:copied=0
@@ -31,12 +37,25 @@ function Relative($value) {
     return $p.TrimEnd('\')
 }
 function Persist {
-    Save-PresetSettings $script:settings $script:presets $script:lastPreset
+    Save-PresetSettings $script:settings $script:presets $script:lastPreset $script:presetDrives
+}
+# Rebuilds the "SendTo" shortcuts so direct preset entries stay in sync with saved settings.
+function Update-SendToShortcuts {
+    try {
+        $list=@($script:presets.Keys|ForEach-Object {[pscustomobject]@{name=$_;path=$script:presets[$_]}})
+        Sync-PresetSendToShortcuts -TargetScript $script:scriptPath -Presets $list
+    } catch {}
 }
 if(Test-Path -LiteralPath $script:settings) {
     try {
         $saved=Get-PresetSettings $script:settings
-        foreach($p in @($saved.presets)){if($p.name -and $null -ne $p.path){$script:presets[[string]$p.name]=[string]$p.path}}
+        foreach($p in @($saved.presets)){
+            if($p.name -and $null -ne $p.path){
+                $name=[string]$p.name
+                $script:presets[$name]=[string]$p.path
+                if($p.drives){$script:presetDrives[$name]=@($p.drives|ForEach-Object {[string]$_})}
+            }
+        }
         $script:lastPreset=[string]$saved.lastSelectedPreset
     } catch {Alert "保存設定を読めません: $_"}
 }
@@ -137,6 +156,132 @@ function CopyDir($src,$dest){
         elseif([IO.File]::Exists($entry)){CopyFile $entry $target}
     }
 }
+# Runs the copy loop shared by the full UI and the direct preset mode.
+function Start-CopyOperation([string[]]$Sources,[string[]]$Destinations){
+    $script:all=$null;$script:cancel=$false;$script:copied=0;$script:skipped=0
+    $work=Get-CopyWork $Sources
+    $script:total=$work.Count*$Destinations.Count;$script:totalWork=$work.Work*$Destinations.Count;$script:completedWork=0
+    if($script:progressBar){$script:progressBar.Maximum=1000;$script:progressBar.Value=0}
+    Update-CopyProgress
+    foreach($root in $Destinations){
+        foreach($src in $Sources){
+            if($script:cancel){break}
+            $name=[IO.Path]::GetFileName(([string]$src).TrimEnd('\'))
+            $target=Join-Path $root $name
+            if([IO.Directory]::Exists([string]$src)){CopyDir ([string]$src) $target}
+            else{CopyFile ([string]$src) $target}
+        }
+        if($script:cancel){break}
+    }
+    if(!$script:cancel -and $script:totalWork -eq 0 -and $script:progressBar){$script:progressBar.Value=$script:progressBar.Maximum}
+}
+# Shows a Windows notification and keeps the process alive long enough for it to appear.
+function Show-CopyNotification([string]$Title,[string]$Message,[string]$Level='Info'){
+    try{
+        $notify=New-Object Windows.Forms.NotifyIcon
+        $notify.Icon=[Drawing.SystemIcons]::Information
+        if($Level -eq 'Warning'){$notify.Icon=[Drawing.SystemIcons]::Warning}
+        $notify.Text='Multi Drive Copy'
+        $notify.Visible=$true
+        $notify.BalloonTipTitle=$Title
+        $notify.BalloonTipText=$Message
+        $notify.BalloonTipIcon=$Level
+        $notify.ShowBalloonTip(4000)
+        $until=[DateTime]::UtcNow.AddSeconds(4)
+        while([DateTime]::UtcNow -lt $until){[Windows.Forms.Application]::DoEvents();Start-Sleep -Milliseconds 100}
+        $notify.Visible=$false
+        $notify.Dispose()
+    }catch{}
+}
+function Get-PresetDriveLetters([string]$Name){
+    if($script:presetDrives.Contains($Name)){
+        $stored=@($script:presetDrives[$Name]|Where-Object {$_})
+        if($stored.Count){return @($stored)}
+    }
+    return @('E','F','G')
+}
+# Copies without showing the settings form; only prompts when a decision is required.
+function Invoke-PresetCopy([string]$PresetName,[string[]]$Sources){
+    $progressForm=$null
+    try{
+        if(-not $script:presets.Contains($PresetName)){
+            Alert ('プリセットが見つかりません: '+$PresetName+'。「送る」の設定メニューから開き直してください。')
+            return
+        }
+        $selected=@($Sources|Where-Object {$_ -and (Test-Path -LiteralPath $_)}|ForEach-Object {(Get-Item -LiteralPath $_).FullName})
+        if(-not $selected.Count){
+            Alert 'コピー元がありません。エクスプローラーでファイル・フォルダを選択してから「送る」で実行してください。'
+            return
+        }
+        $relative=Relative ([string]$script:presets[$PresetName])
+        $letters=@(Get-PresetDriveLetters $PresetName)
+        $available=@();$missing=@()
+        foreach($letter in $letters){
+            if(Test-Path -LiteralPath ($letter+':\')){$available+=,$letter}else{$missing+=,$letter}
+        }
+        if($missing.Count){
+            $missingText=($missing|ForEach-Object {$_+':'}) -join ', '
+            if(-not $available.Count){Alert ('コピー先ドライブが接続されていません: '+$missingText);return}
+            $availableText=($available|ForEach-Object {$_+':'}) -join ', '
+            $question='次のドライブが接続されていません: '+$missingText+[Environment]::NewLine+'接続済みのドライブ ('+$availableText+') だけにコピーしますか？'
+            if([Windows.Forms.MessageBox]::Show($question,'ドライブ未接続','YesNo','Warning') -ne 'Yes'){return}
+        }
+        $destinations=@(Resolve-CopyDestinations -Sources $selected -RelativePath $relative -DriveLetters $available)
+        $missingDirectories=@(Get-MissingDestinationDirectories $destinations)
+        if($missingDirectories.Count){
+            $question='コピー元: '+$selected.Count+' 項目'+[Environment]::NewLine+'コピー先: '+($destinations -join ', ')+[Environment]::NewLine+'新規作成するフォルダ:'+[Environment]::NewLine+($missingDirectories -join [Environment]::NewLine)+[Environment]::NewLine+'コピーしますか？'
+            if([Windows.Forms.MessageBox]::Show($question,'実行確認','YesNo','Question') -ne 'Yes'){return}
+        }
+        foreach($directory in $missingDirectories){New-Item -ItemType Directory -Path $directory -Force|Out-Null}
+        $progressForm=New-Object Windows.Forms.Form
+        $progressForm.Text='Multi Drive Copy - '+$PresetName
+        $progressForm.StartPosition='CenterScreen'
+        $progressForm.FormBorderStyle='FixedDialog'
+        $progressForm.MaximizeBox=$false
+        $progressForm.MinimizeBox=$false
+        $progressForm.ControlBox=$false
+        $progressForm.ClientSize=New-Object Drawing.Size(560,190)
+        $progressForm.Add_FormClosing({if($script:copying){$_.Cancel=$true}})
+        $preview=@($selected|Select-Object -First 2|ForEach-Object {[IO.Path]::GetFileName($_)})
+        $sourceText=$preview -join ', '
+        if($selected.Count -gt $preview.Count){$sourceText+=' ほか'+($selected.Count-$preview.Count)+' 件'}
+        $info=New-Object Windows.Forms.Label
+        $info.Text='コピー元 ('+$selected.Count+' 項目): '+$sourceText+[Environment]::NewLine+'コピー先: '+($destinations -join ', ')
+        $info.AutoEllipsis=$true
+        $info.SetBounds(15,12,530,42)
+        $progressForm.Controls.Add($info)
+        $script:statusLabel=New-Object Windows.Forms.Label
+        $script:statusLabel.Text='準備中...'
+        $script:statusLabel.SetBounds(15,58,530,22)
+        $progressForm.Controls.Add($script:statusLabel)
+        $script:progressBar=New-Object Windows.Forms.ProgressBar
+        $script:progressBar.SetBounds(15,86,530,18)
+        $script:progressBar.Minimum=0
+        $script:progressBar.Maximum=1000
+        $progressForm.Controls.Add($script:progressBar)
+        $cancelButton=Button 'キャンセル' 415 125 130
+        $cancelButton.Add_Click({$script:cancel=$true;$this.Enabled=$false;$this.Text='中止しています...'})
+        $progressForm.Controls.Add($cancelButton)
+        $script:copying=$true
+        $progressForm.Show()
+        [Windows.Forms.Application]::DoEvents()
+        Start-CopyOperation -Sources $selected -Destinations $destinations
+        $script:copying=$false
+        $progressForm.Close()
+        $progressForm.Dispose()
+        $progressForm=$null
+        $summary='コピー: '+$script:copied+' 件 / スキップ: '+$script:skipped+' 件'
+        if($script:cancel){Show-CopyNotification 'コピーを中止しました' $summary 'Warning'}
+        else{Show-CopyNotification 'コピーが完了しました' $summary 'Info'}
+    }catch{
+        if($progressForm){$script:copying=$false;$progressForm.Close();$progressForm.Dispose()}
+        Alert ('コピーエラー: '+$_.Exception.Message+' （途中までコピーされている場合があります）')
+    }
+}
+if($Preset){
+    Invoke-PresetCopy $Preset $Sources
+    return
+}
 $form=New-Object Windows.Forms.Form
 $form.Text='Multi Drive Copy - E / F / G'
 $form.StartPosition='CenterScreen'
@@ -197,15 +342,26 @@ $copy.Height=36
 $form.Controls.Add($copy)
 $combo.Add_SelectedIndexChanged({
     $name=[string]$combo.SelectedItem
-    if($script:presets.Contains($name)){$pathbox.Text=[string]$script:presets[$name];$script:lastPreset=$name;Persist}
+    if($script:presets.Contains($name)){
+        $pathbox.Text=[string]$script:presets[$name]
+        $script:lastPreset=$name
+        $stored=@()
+        if($script:presetDrives.Contains($name)){$stored=@($script:presetDrives[$name])}
+        foreach($cb in $drives){$cb.Checked=($stored.Count -eq 0 -or $stored -contains $cb.Tag)}
+        Persist
+    }
 })
 $save.Add_Click({
     try{
         $p=Relative $pathbox.Text
         $name=[Microsoft.VisualBasic.Interaction]::InputBox('パターン名','コピー先を保存',[string]$combo.Text).Trim()
         if(!$name){return}
+        if($name -match '[\r\n"]'){throw 'パターン名に引用符や改行は使用できません。'}
         $script:presets[$name]=$p
+        $checked=@($drives|Where-Object {$_.Checked}|ForEach-Object {[string]$_.Tag})
+        if($checked.Count){$script:presetDrives[$name]=$checked}else{$script:presetDrives.Remove($name)}
         Persist
+        Update-SendToShortcuts
         if(!$combo.Items.Contains($name)){[void]$combo.Items.Add($name)}
         $combo.SelectedItem=$name
     }catch{Alert $_.Exception.Message}
@@ -215,7 +371,9 @@ $remove.Add_Click({
     if(!$name){return}
     if([Windows.Forms.MessageBox]::Show("パターン '$name' を削除しますか？",'確認','YesNo','Question') -ne 'Yes'){return}
     $script:presets.Remove($name)
+    $script:presetDrives.Remove($name)
     Persist
+    Update-SendToShortcuts
     $combo.Items.Remove($name)
     if($combo.Items.Count){$combo.SelectedIndex=0}else{$pathbox.Clear()}
 })
@@ -223,46 +381,18 @@ $copy.Add_Click({
     try{
         if(!$list.Items.Count){throw 'コピー元がありません。「送る」から起動してください。'}
         $relative=Relative $pathbox.Text
-        $letters=@($drives|Where-Object {$_.Checked}|ForEach-Object {$_.Tag})
-        if(!$letters.Count){throw 'コピー先ドライブを選んでください。'}
-        $destinations=@()
-        foreach($letter in $letters){
-            $root=$letter+':\'
-            if(!(Test-Path -LiteralPath $root)){throw 'ドライブが存在しません: '+$root}
-            if($relative){$root=Join-Path $root $relative}
-            $destinations+=,$root
-            foreach($src in $list.Items){
-                $full=[IO.Path]::GetFullPath([string]$src).TrimEnd('\')
-                $target=[IO.Path]::GetFullPath((Join-Path $root ([IO.Path]::GetFileName($full)))).TrimEnd('\')
-                if($full.Equals($target,[StringComparison]::OrdinalIgnoreCase) -or $target.StartsWith($full+'\',[StringComparison]::OrdinalIgnoreCase)){
-                    throw 'コピー元自身・コピー元配下へのコピーはできません: '+$target
-                }
-            }
-        }
+        $letters=@($drives|Where-Object {$_.Checked}|ForEach-Object {[string]$_.Tag})
+        $sources=@($list.Items|ForEach-Object {[string]$_})
+        $destinations=@(Resolve-CopyDestinations -Sources $sources -RelativePath $relative -DriveLetters $letters)
         $missingDirectories=@(Get-MissingDestinationDirectories $destinations)
         $question='コピー元: '+$list.Items.Count+' 項目'+[Environment]::NewLine+'コピー先: '+($destinations -join ', ')+[Environment]::NewLine+'コピーしますか？'
         if($missingDirectories.Count){$question+=[Environment]::NewLine+'新規作成するフォルダ:'+[Environment]::NewLine+($missingDirectories -join [Environment]::NewLine)}
         if([Windows.Forms.MessageBox]::Show($question,'実行確認','YesNo','Question') -ne 'Yes'){return}
         foreach($directory in $missingDirectories){New-Item -ItemType Directory -Path $directory -Force|Out-Null}
-        $script:all=$null;$script:cancel=$false;$script:copied=0;$script:skipped=0
-        $work=Get-CopyWork @($list.Items)
-        $script:total=$work.Count*$destinations.Count;$script:totalWork=$work.Work*$destinations.Count;$script:completedWork=0
-        $progress.Maximum=1000;$progress.Value=0
         $script:copying=$true
         foreach($control in @($list,$combo,$save,$remove,$pathbox,$copy)+$drives){$control.Enabled=$false}
         $form.Cursor='WaitCursor'
-        Update-CopyProgress
-        foreach($root in $destinations){
-            foreach($src in $list.Items){
-                if($script:cancel){break}
-                $name=[IO.Path]::GetFileName(([string]$src).TrimEnd('\'))
-                $target=Join-Path $root $name
-                if([IO.Directory]::Exists([string]$src)){CopyDir ([string]$src) $target}
-                else{CopyFile ([string]$src) $target}
-            }
-            if($script:cancel){break}
-        }
-        if(!$script:cancel -and $script:totalWork -eq 0){$progress.Value=$progress.Maximum}
+        Start-CopyOperation -Sources $sources -Destinations $destinations
         $status.Text='コピー: '+$script:copied+' 件 / スキップ: '+$script:skipped+' 件'
         $heading=if($script:cancel){'処理を中止しました。'}else{'コピーが完了しました。'}
         [Windows.Forms.MessageBox]::Show($heading+' '+$status.Text,'結果','OK','Information')|Out-Null
