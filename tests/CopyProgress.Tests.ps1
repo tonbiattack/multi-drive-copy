@@ -1,6 +1,21 @@
 ﻿$projectRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $projectRoot 'MultiDriveCopy.Core.ps1')
 
+# WScript.Shell resolves shortcut paths through the ANSI code page, so reading a
+# shortcut whose file name is non-ASCII fails on systems whose code page cannot
+# represent it. Copy it to an ASCII name first, then read that copy.
+function Get-ShortcutInfo([string]$Path) {
+    $staging = Join-Path ([IO.Path]::GetTempPath()) ('mdc-read-' + [guid]::NewGuid().ToString('N') + '.lnk')
+    try {
+        [IO.File]::Copy($Path, $staging, $true)
+        $shell = New-Object -ComObject WScript.Shell
+        $link = $shell.CreateShortcut($staging)
+        return [pscustomobject]@{ Arguments = $link.Arguments; TargetPath = $link.TargetPath }
+    } finally {
+        Remove-Item -LiteralPath $staging -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Describe 'copy progress helpers' {
     It 'counts files recursively and excludes directories' {
         $root = Join-Path $TestDrive 'source'
@@ -78,8 +93,7 @@ Describe 'copy progress helpers' {
         (Test-Path -LiteralPath (Join-Path $sendTo 'E F G に一括コピー - Daily.lnk')) | Should Be $true
         (Test-Path -LiteralPath (Join-Path $sendTo 'E F G に一括コピー - A_B.lnk')) | Should Be $true
         (Test-Path -LiteralPath (Join-Path $sendTo 'E F G に一括コピー - A_B (2).lnk')) | Should Be $true
-        $shell = New-Object -ComObject WScript.Shell
-        $link = $shell.CreateShortcut((Join-Path $sendTo 'E F G に一括コピー - Daily.lnk'))
+        $link = Get-ShortcutInfo (Join-Path $sendTo 'E F G に一括コピー - Daily.lnk')
         $link.Arguments | Should Match '-Preset "Daily"'
         $link.TargetPath | Should Match 'powershell\.exe$'
     }
@@ -99,8 +113,7 @@ Describe 'copy progress helpers' {
         (Test-Path -LiteralPath (Join-Path $sendTo 'E F G に一括コピー - Daily.lnk')) | Should Be $true
         (Test-Path -LiteralPath (Join-Path $sendTo 'E F G に一括コピー（検証してごみ箱へ） - Archive.lnk')) | Should Be $true
         (Test-Path -LiteralPath (Join-Path $sendTo 'E F G に一括コピー - Archive.lnk')) | Should Be $false
-        $shell = New-Object -ComObject WScript.Shell
-        $link = $shell.CreateShortcut((Join-Path $sendTo 'E F G に一括コピー（検証してごみ箱へ） - Archive.lnk'))
+        $link = Get-ShortcutInfo (Join-Path $sendTo 'E F G に一括コピー（検証してごみ箱へ） - Archive.lnk')
         $link.Arguments | Should Match '-Preset "Archive"'
     }
 
