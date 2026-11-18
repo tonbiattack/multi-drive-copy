@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify PowerShell 5.1 is available
+        shell: pwsh
+        run: |
+          $version = & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+          Write-Host "Windows PowerShell: $version"
+          if (-not $version.StartsWith('5.1')) {
+            Write-Error "Windows PowerShell 5.1 is required."
+            exit 1
+          }
+
+      - name: Check UTF-8 BOM on PowerShell files
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($file in @('MultiDriveCopy.ps1', 'MultiDriveCopy.Core.ps1', 'Install.ps1', 'Uninstall.ps1')) {
+            $bytes = [IO.File]::ReadAllBytes((Join-Path $PWD $file))
+            if ($bytes[0] -ne 0xEF -or $bytes[1] -ne 0xBB -or $bytes[2] -ne 0xBF) {
+              Write-Host "::error file=$file::PowerShell files must be UTF-8 with a BOM."
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Parse scripts
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($file in @('MultiDriveCopy.ps1', 'MultiDriveCopy.Core.ps1', 'Install.ps1', 'Uninstall.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $file), [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Host "::error file=$file::$($_.Message)" }
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Run Pester tests
+        shell: pwsh
+        run: |
+          Import-Module Pester -RequiredVersion 3.4.0
+          $result = Invoke-Pester -Path .\tests -PassThru
+          if ($result.FailedCount -gt 0) {
+            Write-Error "$($result.FailedCount) test(s) failed."
+            exit 1
+          }
