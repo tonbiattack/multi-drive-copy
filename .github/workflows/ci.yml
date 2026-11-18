@@ -56,9 +56,17 @@ jobs:
       - name: Run Pester tests
         shell: pwsh
         run: |
+          # The suite targets Windows PowerShell 5.1 (the runtime the app ships on),
+          # so run it under powershell.exe rather than the pwsh 7 runner default.
+          $script = @'
+          $ErrorActionPreference = "Stop"
           Import-Module Pester -RequiredVersion 3.4.0
           $result = Invoke-Pester -Path .\tests -PassThru
           if ($result.FailedCount -gt 0) {
-            Write-Error "$($result.FailedCount) test(s) failed."
-            exit 1
+              Write-Host "::error::$($result.FailedCount) test(s) failed."
+              exit 1
           }
+          '@
+          $script | Out-File -FilePath run-tests.ps1 -Encoding utf8
+          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File .\run-tests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
