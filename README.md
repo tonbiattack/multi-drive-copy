@@ -131,7 +131,7 @@ powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File "C:\path\MultiDrive
 | 要件 | 補足 |
 | --- | --- |
 | Windows 10 / 11 | ごみ箱移動は `Microsoft.VisualBasic.FileIO.FileSystem` の `SendToRecycleBin` を使用 |
-| Windows PowerShell 5.1 | Windows に標準搭載。PowerShell 7 では動作しません |
+| Windows PowerShell 5.1 | Windows に標準搭載。動作対象は 5.1 で、PowerShell 7 は対象外です |
 | .NET Windows Forms | Windows に標準搭載 |
 
 外部ランタイム、パッケージマネージャー、管理者権限は不要です。
