@@ -15,6 +15,7 @@ $script:settings=Join-Path $env:APPDATA 'MultiDriveCopy\presets.json'
 $script:scriptPath=$PSCommandPath
 $script:presets=[ordered]@{}
 $script:presetDrives=@{}
+$script:presetRecycle=@{}
 $script:all=$null
 $script:cancel=$false
 $script:copied=0
@@ -41,12 +42,12 @@ function Relative($value) {
     return $p.TrimEnd('\')
 }
 function Persist {
-    Save-PresetSettings $script:settings $script:presets $script:lastPreset $script:presetDrives
+    Save-PresetSettings $script:settings $script:presets $script:lastPreset $script:presetDrives $script:presetRecycle
 }
 # Rebuilds the "SendTo" shortcuts so direct preset entries stay in sync with saved settings.
 function Update-SendToShortcuts {
     try {
-        $list=@($script:presets.Keys|ForEach-Object {[pscustomobject]@{name=$_;path=$script:presets[$_]}})
+        $list=@($script:presets.Keys|ForEach-Object {[pscustomobject]@{name=$_;path=$script:presets[$_];recycle=[bool]$script:presetRecycle[$_]}})
         Sync-PresetSendToShortcuts -TargetScript $script:scriptPath -Presets $list
     } catch {}
 }
@@ -58,6 +59,7 @@ if(Test-Path -LiteralPath $script:settings) {
                 $name=[string]$p.name
                 $script:presets[$name]=[string]$p.path
                 if($p.drives){$script:presetDrives[$name]=@($p.drives|ForEach-Object {[string]$_})}
+                if($p.recycle){$script:presetRecycle[$name]=$true}
             }
         }
         $script:lastPreset=[string]$saved.lastSelectedPreset
@@ -378,6 +380,42 @@ function Get-PresetDriveLetters([string]$Name){
     }
     return @('E','F','G')
 }
+# Verifies every copied source against all destinations and returns the top-level results.
+function Get-CopyVerificationResults([string[]]$Sources,[string[]]$Destinations,[scriptblock]$OnStatus){
+    $sourceFiles=@($script:sourceFiles)
+    $selectedFolders=@($Sources|Where-Object {[IO.Directory]::Exists($_)})
+    $fileTotal=[Math]::Max(1,$sourceFiles.Count)
+    if($OnStatus){& $OnStatus '検証中...' 0 $fileTotal}
+    $fileResults=@(Get-CopyVerification -SourceFiles $sourceFiles -CopyMap @($script:copyMap) -DestinationCount $Destinations.Count -OnProgress {
+        param($i,$path)
+        if($OnStatus){& $OnStatus ('ファイル検証中: '+$i+' / '+$sourceFiles.Count+' 件') $i $fileTotal}
+    })
+    $folderResults=@()
+    if($selectedFolders.Count){
+        if($OnStatus){& $OnStatus 'フォルダ構造を検証中...' 0 ([Math]::Max(1,$selectedFolders.Count))}
+        $folderResults=@(Get-FolderVerification -SourceFolders $selectedFolders -FileResults $fileResults -DirectoryMap @($script:copyDirMap) -DestinationCount $Destinations.Count -OnProgress {
+            param($i,$path)
+            if($OnStatus){& $OnStatus ('フォルダ検証中: '+$i+' / '+$selectedFolders.Count+' 件') $i ([Math]::Max(1,$selectedFolders.Count))}
+        })
+    }
+    $topResults=New-Object System.Collections.ArrayList
+    foreach($source in $Sources){
+        if([IO.Directory]::Exists($source)){
+            $folderResult=@($folderResults|Where-Object {(Get-PathKey ([string]$_.Source)) -eq (Get-PathKey $source)})|Select-Object -First 1
+            if($folderResult){[void]$topResults.Add($folderResult)}
+        } else {
+            $fileResult=@($fileResults|Where-Object {(Get-PathKey ([string]$_.Source)) -eq (Get-PathKey $source)})|Select-Object -First 1
+            if($fileResult){[void]$topResults.Add($fileResult)}
+        }
+    }
+    if(Test-SourceOverlap $Sources){
+        foreach($item in $topResults){$item.Status='Protected';$item.Reason='コピー元が入れ子または重複しているため移動できません'}
+    } elseif(Test-SourceUnderDestination -Sources $Sources -Destinations $Destinations){
+        foreach($item in $topResults){$item.Status='Protected';$item.Reason='コピー元とコピー先が親子関係にあるため移動できません'}
+    }
+    $logPath=Join-Path $env:APPDATA ('MultiDriveCopy\logs\verify-'+(Get-Date -Format 'yyyyMMdd-HHmmss-fff')+'.log')
+    return @{ Results=@($topResults); FileResults=$fileResults; LogPath=$logPath }
+}
 # Copies without showing the settings form; only prompts when a decision is required.
 function Invoke-PresetCopy([string]$PresetName,[string[]]$Sources){
     $progressForm=$null
@@ -444,12 +482,30 @@ function Invoke-PresetCopy([string]$PresetName,[string[]]$Sources){
         $progressForm.Show()
         [Windows.Forms.Application]::DoEvents()
         Start-CopyOperation -Sources $selected -Destinations $destinations
+        $recycle=[bool]$script:presetRecycle[$PresetName]
+        if($recycle -and -not $script:cancel){
+            $verification=Get-CopyVerificationResults -Sources $selected -Destinations $destinations -OnStatus {
+                param($text,$i,$total)
+                $script:statusLabel.Text=$text
+                if($total -gt 0 -and $script:progressBar){
+                    $script:progressBar.Maximum=$total
+                    $script:progressBar.Value=[Math]::Min($total,$i)
+                }
+                [Windows.Forms.Application]::DoEvents()
+            }
+            $summary=Get-VerificationSummary @($verification.Results)
+            $script:statusLabel.Text='検証成功: '+$summary.Verified+' 件 / 不一致: '+$summary.Mismatch+' 件 / 保護: '+$summary.Protected+' 件'
+            if($script:progressBar){$script:progressBar.Value=$script:progressBar.Maximum}
+            [Windows.Forms.Application]::DoEvents()
+            Show-VerificationResult -Results @($verification.Results) -LogPath $verification.LogPath -Owner $progressForm -FileResults @($verification.FileResults)
+        }
         $script:copying=$false
         $progressForm.Close()
         $progressForm.Dispose()
         $progressForm=$null
         $summary='コピー: '+$script:copied+' 件 / スキップ: '+$script:skipped+' 件'
         if($script:cancel){Show-CopyNotification 'コピーを中止しました' $summary 'Warning'}
+        elseif($recycle){Show-CopyNotification 'コピーと検証が完了しました' $summary 'Info'}
         else{Show-CopyNotification 'コピーが完了しました' $summary 'Info'}
     }catch{
         if($progressForm){$script:copying=$false;$progressForm.Close();$progressForm.Dispose()}
@@ -508,7 +564,7 @@ for($i=0;$i -lt 3;$i++){
     $form.Controls.Add($cb)
 }
 $recycle=New-Object Windows.Forms.CheckBox
-$recycle.Text='コピー後、検証済みの元データをごみ箱へ移動（プリセットには保存しません）'
+$recycle.Text='コピー後、検証済みの元データをごみ箱へ移動（パターン保存時に記録し、「送る」から1回で実行できます）'
 $recycle.SetBounds(15,405,670,25)
 $recycle.Checked=$false
 $form.Controls.Add($recycle)
@@ -537,6 +593,7 @@ $combo.Add_SelectedIndexChanged({
         $stored=@()
         if($script:presetDrives.Contains($name)){$stored=@($script:presetDrives[$name])}
         foreach($cb in $drives){$cb.Checked=($stored.Count -eq 0 -or $stored -contains $cb.Tag)}
+        $recycle.Checked=[bool]$script:presetRecycle[$name]
         Persist
     }
 })
@@ -549,6 +606,7 @@ $save.Add_Click({
         $script:presets[$name]=$p
         $checked=@($drives|Where-Object {$_.Checked}|ForEach-Object {[string]$_.Tag})
         if($checked.Count){$script:presetDrives[$name]=$checked}else{$script:presetDrives.Remove($name)}
+        if($recycle.Checked){$script:presetRecycle[$name]=$true}else{$script:presetRecycle.Remove($name)}
         Persist
         Update-SendToShortcuts
         if(!$combo.Items.Contains($name)){[void]$combo.Items.Add($name)}
@@ -561,6 +619,7 @@ $remove.Add_Click({
     if([Windows.Forms.MessageBox]::Show("パターン '$name' を削除しますか？",'確認','YesNo','Question') -ne 'Yes'){return}
     $script:presets.Remove($name)
     $script:presetDrives.Remove($name)
+    $script:presetRecycle.Remove($name)
     Persist
     Update-SendToShortcuts
     $combo.Items.Remove($name)
@@ -585,44 +644,19 @@ $copy.Add_Click({
         Start-CopyOperation -Sources $sources -Destinations $destinations
         if($recycle.Checked -and -not $script:cancel){
             $sourceFiles=@($script:sourceFiles)
-            $selectedFolders=@($sources|Where-Object {[IO.Directory]::Exists($_)})
             $status.Text='検証中...'
             $progress.Maximum=[Math]::Max(1,$sourceFiles.Count)
             $progress.Value=0
             [Windows.Forms.Application]::DoEvents()
-            $fileResults=@(Get-CopyVerification -SourceFiles $sourceFiles -CopyMap @($script:copyMap) -DestinationCount $destinations.Count -OnProgress {
-                param($i,$path)
-                $status.Text='ファイル検証中: '+$i+' / '+$sourceFiles.Count+' 件'
-                $progress.Value=[Math]::Min($progress.Maximum,$i)
+            $verification=Get-CopyVerificationResults -Sources $sources -Destinations $destinations -OnStatus {
+                param($text,$i,$total)
+                $status.Text=$text
+                if($total -gt 0){$progress.Maximum=$total;$progress.Value=[Math]::Min($total,$i)}
                 [Windows.Forms.Application]::DoEvents()
-            })
-            $folderResults=@()
-            if($selectedFolders.Count){
-                $status.Text='フォルダ構造を検証中...'
-                [Windows.Forms.Application]::DoEvents()
-                $folderResults=@(Get-FolderVerification -SourceFolders $selectedFolders -FileResults $fileResults -DirectoryMap @($script:copyDirMap) -DestinationCount $destinations.Count -OnProgress {
-                    param($i,$path)
-                    $status.Text='フォルダ検証中: '+$i+' / '+$selectedFolders.Count+' 件'
-                    [Windows.Forms.Application]::DoEvents()
-                })
             }
-            $topResults=New-Object System.Collections.ArrayList
-            foreach($source in $sources){
-                if([IO.Directory]::Exists($source)){
-                    $folderResult=@($folderResults|Where-Object {(Get-PathKey ([string]$_.Source)) -eq (Get-PathKey $source)})|Select-Object -First 1
-                    if($folderResult){[void]$topResults.Add($folderResult)}
-                } else {
-                    $fileResult=@($fileResults|Where-Object {(Get-PathKey ([string]$_.Source)) -eq (Get-PathKey $source)})|Select-Object -First 1
-                    if($fileResult){[void]$topResults.Add($fileResult)}
-                }
-            }
-            if(Test-SourceOverlap $sources){
-                foreach($item in $topResults){$item.Status='Protected';$item.Reason='コピー元が入れ子または重複しているため移動できません'}
-            } elseif(Test-SourceUnderDestination -Sources $sources -Destinations $destinations){
-                foreach($item in $topResults){$item.Status='Protected';$item.Reason='コピー元とコピー先が親子関係にあるため移動できません'}
-            }
-            $results=@($topResults)
-            $logPath=Join-Path $env:APPDATA ('MultiDriveCopy\logs\verify-'+(Get-Date -Format 'yyyyMMdd-HHmmss-fff')+'.log')
+            $results=@($verification.Results)
+            $fileResults=@($verification.FileResults)
+            $logPath=$verification.LogPath
             $summary=Get-VerificationSummary $results
             $status.Text='検証成功: '+$summary.Verified+' 件 / 不一致: '+$summary.Mismatch+' 件 / 保護: '+$summary.Protected+' 件'
             $progress.Value=$progress.Maximum

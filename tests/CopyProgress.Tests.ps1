@@ -1,6 +1,21 @@
 ﻿$projectRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $projectRoot 'MultiDriveCopy.Core.ps1')
 
+# WScript.Shell resolves shortcut paths through the ANSI code page, so reading a
+# shortcut whose file name is non-ASCII fails on systems whose code page cannot
+# represent it. Copy it to an ASCII name first, then read that copy.
+function Get-ShortcutInfo([string]$Path) {
+    $staging = Join-Path ([IO.Path]::GetTempPath()) ('mdc-read-' + [guid]::NewGuid().ToString('N') + '.lnk')
+    try {
+        [IO.File]::Copy($Path, $staging, $true)
+        $shell = New-Object -ComObject WScript.Shell
+        $link = $shell.CreateShortcut($staging)
+        return [pscustomobject]@{ Arguments = $link.Arguments; TargetPath = $link.TargetPath }
+    } finally {
+        Remove-Item -LiteralPath $staging -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Describe 'copy progress helpers' {
     It 'counts files recursively and excludes directories' {
         $root = Join-Path $TestDrive 'source'
@@ -78,10 +93,55 @@ Describe 'copy progress helpers' {
         (Test-Path -LiteralPath (Join-Path $sendTo 'E F G に一括コピー - Daily.lnk')) | Should Be $true
         (Test-Path -LiteralPath (Join-Path $sendTo 'E F G に一括コピー - A_B.lnk')) | Should Be $true
         (Test-Path -LiteralPath (Join-Path $sendTo 'E F G に一括コピー - A_B (2).lnk')) | Should Be $true
-        $shell = New-Object -ComObject WScript.Shell
-        $link = $shell.CreateShortcut((Join-Path $sendTo 'E F G に一括コピー - Daily.lnk'))
+        $link = Get-ShortcutInfo (Join-Path $sendTo 'E F G に一括コピー - Daily.lnk')
         $link.Arguments | Should Match '-Preset "Daily"'
         $link.TargetPath | Should Match 'powershell\.exe$'
+    }
+
+    It 'creates a recycle shortcut for presets that verify and recycle sources' {
+        $sendTo = Join-Path $TestDrive 'SendToRecycle'
+        New-Item -ItemType Directory -Path $sendTo | Out-Null
+        $target = Join-Path $TestDrive 'MultiDriveCopy.ps1'
+        Set-Content -LiteralPath $target -Value '# test'
+        $presets = @(
+            [pscustomobject]@{ name = 'Daily'; path = 'Backup\Daily' },
+            [pscustomobject]@{ name = 'Archive'; path = 'Backup\Archive'; recycle = $true }
+        )
+
+        Sync-PresetSendToShortcuts -TargetScript $target -Presets $presets -SendToPath $sendTo
+
+        (Test-Path -LiteralPath (Join-Path $sendTo 'E F G に一括コピー - Daily.lnk')) | Should Be $true
+        (Test-Path -LiteralPath (Join-Path $sendTo 'E F G に一括コピー（検証してごみ箱へ） - Archive.lnk')) | Should Be $true
+        (Test-Path -LiteralPath (Join-Path $sendTo 'E F G に一括コピー - Archive.lnk')) | Should Be $false
+        $link = Get-ShortcutInfo (Join-Path $sendTo 'E F G に一括コピー（検証してごみ箱へ） - Archive.lnk')
+        $link.Arguments | Should Match '-Preset "Archive"'
+    }
+
+    It 'removes a recycle shortcut when the preset no longer recycles' {
+        $sendTo = Join-Path $TestDrive 'SendToRecycleOff'
+        New-Item -ItemType Directory -Path $sendTo | Out-Null
+        $target = Join-Path $TestDrive 'MultiDriveCopy.ps1'
+        Set-Content -LiteralPath $target -Value '# test'
+        $recyclePreset = @([pscustomobject]@{ name = 'Archive'; path = 'Backup\Archive'; recycle = $true })
+        $plainPreset = @([pscustomobject]@{ name = 'Archive'; path = 'Backup\Archive' })
+
+        Sync-PresetSendToShortcuts -TargetScript $target -Presets $recyclePreset -SendToPath $sendTo
+        Sync-PresetSendToShortcuts -TargetScript $target -Presets $plainPreset -SendToPath $sendTo
+
+        (Test-Path -LiteralPath (Join-Path $sendTo 'E F G に一括コピー（検証してごみ箱へ） - Archive.lnk')) | Should Be $false
+        (Test-Path -LiteralPath (Join-Path $sendTo 'E F G に一括コピー - Archive.lnk')) | Should Be $true
+    }
+
+    It 'round-trips the recycle flag through preset settings' {
+        $settingsPath = Join-Path $TestDrive 'recycle-presets.json'
+        Save-PresetSettings $settingsPath ([ordered]@{ Daily = 'Backup\Daily'; Archive = 'Backup\Archive' }) 'Daily' @{ Daily = @('E') } @{ Archive = $true }
+
+        $settings = Get-PresetSettings $settingsPath
+
+        $daily = @($settings.presets | Where-Object { $_.name -eq 'Daily' })[0]
+        $archive = @($settings.presets | Where-Object { $_.name -eq 'Archive' })[0]
+        $daily.recycle | Should BeNullOrEmpty
+        $archive.recycle | Should Be $true
     }
 
     It 'returns the enumerated files for verification' {
@@ -643,5 +703,78 @@ Describe 'folder verification behavior' {
         (Test-FolderResultStillValid $results2.FolderResults[0]) | Should Be $true
         Set-Content -LiteralPath (Join-Path $fixture2.Source 'added.txt') -Value 'new'
         (Test-FolderResultStillValid $results2.FolderResults[0]) | Should Be $false
+    }
+}
+
+Describe 'one-click verify and recycle flow' {
+    BeforeAll {
+        Add-Type -AssemblyName System.Windows.Forms
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $projectRoot 'MultiDriveCopy.ps1'), [ref]$null, [ref]$null)
+        foreach ($name in @('Add-CopyMapping', 'Add-CopyDirMapping', 'Unique', 'CopyFile', 'CopyDir', 'Update-CopyProgress', 'Start-CopyOperation', 'Complete-CopyAndClose', 'Get-CopyVerificationResults')) {
+            $definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }.GetNewClosure(), $true)
+            if ($definition) { . ([scriptblock]::Create($definition.Extent.Text)) }
+        }
+        function Conflict($path) { if ($script:conflictChoice) { return [string]$script:conflictChoice }; return 'Skip' }
+    }
+    BeforeEach {
+        $script:cancel = $false; $script:copied = 0; $script:skipped = 0
+        $script:completedWork = 0; $script:totalWork = 6; $script:total = 2
+        $script:copyMap = $null
+        $script:copyDirMap = $null
+        $script:conflictChoice = $null
+        $script:sourceFiles = @()
+        $script:progressBar = $null
+        $script:statusLabel = $null
+    }
+
+    It 'returns verified top-level results for files and folders in one call' {
+        $root = Join-Path $TestDrive 'one-click'
+        $file = Join-Path $root 'report.txt'
+        $folder = Join-Path $root 'photos'
+        $destinations = @((Join-Path $root 'dest1'), (Join-Path $root 'dest2'))
+        New-Item -ItemType Directory -Path $folder -Force | Out-Null
+        Set-Content -LiteralPath $file -Value 'report'
+        Set-Content -LiteralPath (Join-Path $folder 'a.jpg') -Value 'photo'
+
+        Start-CopyOperation @($file, $folder) $destinations
+        $verification = Get-CopyVerificationResults -Sources @($file, $folder) -Destinations $destinations
+
+        @($verification.Results).Count | Should Be 2
+        @($verification.Results | Where-Object { $_.Status -eq 'Verified' }).Count | Should Be 2
+        $verification.LogPath | Should Match 'verify-'
+        @($verification.FileResults).Count | Should Be 2
+    }
+
+    It 'reports the verification progress through the status callback' {
+        $root = Join-Path $TestDrive 'one-click-progress'
+        $file = Join-Path $root 'progress.txt'
+        $destination = Join-Path $root 'dest'
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        Set-Content -LiteralPath $file -Value 'progress'
+        $script:observed = New-Object System.Collections.ArrayList
+
+        Start-CopyOperation @($file) @($destination)
+        $verification = Get-CopyVerificationResults -Sources @($file) -Destinations @($destination) -OnStatus {
+            param($text, $i, $total)
+            [void]$script:observed.Add($text)
+        }
+
+        @($script:observed).Count | Should BeGreaterThan 0
+        @($script:observed | Where-Object { $_ -match '検証' }).Count | Should BeGreaterThan 0
+        @($verification.Results)[0].Status | Should Be 'Verified'
+    }
+
+    It 'protects nested sources instead of recycling them' {
+        $root = Join-Path $TestDrive 'one-click-overlap'
+        $parent = Join-Path $root 'parent'
+        $child = Join-Path $parent 'child'
+        $destination = Join-Path $root 'dest'
+        New-Item -ItemType Directory -Path $child -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $child 'file.txt') -Value 'overlap'
+
+        Start-CopyOperation @($parent) @($destination)
+        $verification = Get-CopyVerificationResults -Sources @($parent, $child) -Destinations @($destination)
+
+        @($verification.Results | Where-Object { $_.Status -eq 'Protected' }).Count | Should Be 2
     }
 }

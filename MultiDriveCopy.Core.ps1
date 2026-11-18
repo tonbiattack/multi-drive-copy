@@ -177,7 +177,8 @@ function Save-PresetSettings {
         [string]$Path,
         [System.Collections.IDictionary]$Presets,
         [string]$LastSelectedPreset,
-        [System.Collections.IDictionary]$PresetDrives = $null
+        [System.Collections.IDictionary]$PresetDrives = $null,
+        [System.Collections.IDictionary]$PresetRecycle = $null
     )
 
     New-Item -ItemType Directory -Path (Split-Path $Path) -Force | Out-Null
@@ -186,6 +187,9 @@ function Save-PresetSettings {
         if ($PresetDrives -and $PresetDrives.Contains($_)) {
             $drives = @($PresetDrives[$_] | Where-Object { $_ })
             if ($drives.Count) { $entry['drives'] = $drives }
+        }
+        if ($PresetRecycle -and $PresetRecycle.Contains($_) -and $PresetRecycle[$_]) {
+            $entry['recycle'] = $true
         }
         $entry
     })
@@ -255,33 +259,52 @@ function Sync-PresetSendToShortcuts {
     if (-not $sendTo -or -not (Test-Path -LiteralPath $sendTo)) { return }
 
     $prefix = 'E F G に一括コピー - '
+    $recyclePrefix = 'E F G に一括コピー（検証してごみ箱へ） - '
     Get-ChildItem -LiteralPath $sendTo -Filter ($prefix + '*.lnk') -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+    Get-ChildItem -LiteralPath $sendTo -Filter ($recyclePrefix + '*.lnk') -ErrorAction SilentlyContinue |
         ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
 
     $shell = New-Object -ComObject WScript.Shell
+    # WScript.Shell resolves shortcut paths through the ANSI code page, so a
+    # non-ASCII "SendTo" path fails on systems whose code page cannot represent
+    # it. Build each shortcut at an ASCII-only temp path, then move it into place.
+    $staging = Join-Path ([IO.Path]::GetTempPath()) ('mdc-lnk-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $staging -Force | Out-Null
     $used = @{}
-    foreach ($preset in @($Presets)) {
-        if ($null -eq $preset) { continue }
-        $name = [string]$preset.name
-        if (-not $name -or $name -match '[\r\n"]') { continue }
+    try {
+        foreach ($preset in @($Presets)) {
+            if ($null -eq $preset) { continue }
+            $name = [string]$preset.name
+            if (-not $name -or $name -match '[\r\n"]') { continue }
+            $recycle = [bool]$preset.recycle
 
-        $baseName = ConvertTo-ShortcutFileName $name
-        $fileName = $baseName
-        $suffix = 2
-        while ($used.ContainsKey($fileName.ToLowerInvariant())) {
-            $fileName = '{0} ({1})' -f $baseName, $suffix
-            $suffix++
+            $baseName = ConvertTo-ShortcutFileName $name
+            $fileName = $baseName
+            $suffix = 2
+            while ($used.ContainsKey($fileName.ToLowerInvariant())) {
+                $fileName = '{0} ({1})' -f $baseName, $suffix
+                $suffix++
+            }
+            $used[$fileName.ToLowerInvariant()] = $true
+
+            $shortcutPath = Join-Path $sendTo (($(if ($recycle) { $recyclePrefix } else { $prefix })) + $fileName + '.lnk')
+            $stagedPath = Join-Path $staging ('shortcut-' + $used.Count + '.lnk')
+            $link = $shell.CreateShortcut($stagedPath)
+            $link.TargetPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+            $link.Arguments = '-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $TargetScript + '" -Preset "' + $name + '"'
+            $link.WorkingDirectory = Split-Path -Parent $TargetScript
+            $link.IconLocation = "$env:SystemRoot\System32\shell32.dll,3"
+            if ($recycle) {
+                $link.Description = '選択したファイル・フォルダを ' + $name + ' のコピー先へ一括コピーし、検証後に元データをごみ箱へ移動'
+            } else {
+                $link.Description = '選択したファイル・フォルダを ' + $name + ' のコピー先へ一括コピー'
+            }
+            $link.Save()
+            [IO.File]::Move($stagedPath, $shortcutPath)
         }
-        $used[$fileName.ToLowerInvariant()] = $true
-
-        $shortcutPath = Join-Path $sendTo ($prefix + $fileName + '.lnk')
-        $link = $shell.CreateShortcut($shortcutPath)
-        $link.TargetPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-        $link.Arguments = '-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $TargetScript + '" -Preset "' + $name + '"'
-        $link.WorkingDirectory = Split-Path -Parent $TargetScript
-        $link.IconLocation = "$env:SystemRoot\System32\shell32.dll,3"
-        $link.Description = '選択したファイル・フォルダを ' + $name + ' のコピー先へ一括コピー'
-        $link.Save()
+    } finally {
+        Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
