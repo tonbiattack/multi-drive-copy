@@ -95,11 +95,13 @@ function Button($text,$x,$y,$w){
     $b.Text=$text;$b.SetBounds($x,$y,$w,30);return $b
 }
 # Asks once per collision unless the user chose to apply a choice to all later collisions.
+# ZIP collisions default to Skip so an existing archive is never overwritten by accident.
 function Conflict($path){
     if($script:all){return $script:all}
+    $isZip=Test-ZipFileName ([IO.Path]::GetFileName([string]$path))
     $dlg=New-Object Windows.Forms.Form
-    $dlg.Text='同名ファイルが存在します'
-    $dlg.Size=New-Object Drawing.Size(660,210)
+    $dlg.Text=if($isZip){'同名のZIPが存在します'}else{'同名ファイルが存在します'}
+    $dlg.Size=New-Object Drawing.Size(660,240)
     $dlg.StartPosition='CenterScreen'
     $dlg.FormBorderStyle='FixedDialog'
     $dlg.MaximizeBox=$false
@@ -108,16 +110,29 @@ function Conflict($path){
     $label.SetBounds(15,15,625,60)
     $label.AutoEllipsis=$true
     $dlg.Controls.Add($label)
+    if($isZip){
+        $note=New-Object Windows.Forms.Label
+        $note.Text='同名ZIPは既定でスキップします。上書き・別名保存は明示的に選んでください。同サイズでも内容が同じとは限りません。'
+        $note.SetBounds(15,72,625,34)
+        $dlg.Controls.Add($note)
+    }
     $all=New-Object Windows.Forms.CheckBox
     $all.Text='以降の競合にも適用する'
-    $all.SetBounds(15,80,310,24)
+    $all.SetBounds(15,110,310,24)
     $dlg.Controls.Add($all)
     $opts=@(@('上書き','Overwrite'),@('スキップ','Skip'),@('別名保存','Rename'),@('中止','Cancel'))
+    $skipButton=$null
     for($i=0;$i -lt 4;$i++){
-        $btn=Button $opts[$i][0] (15+155*$i) 116 145
+        $btn=Button $opts[$i][0] (15+155*$i) 146 145
         $btn.Tag=$opts[$i][1]
+        if($opts[$i][1] -eq 'Skip'){$skipButton=$btn}
         $btn.Add_Click({$dlg.Tag=$this.Tag;$dlg.Close()}.GetNewClosure())
         $dlg.Controls.Add($btn)
+    }
+    if($isZip -and $skipButton){
+        # Enter and the highlighted button both resolve to Skip for ZIPs.
+        $dlg.AcceptButton=$skipButton
+        $skipButton.Text='スキップ（既定）'
     }
     [void]$dlg.ShowDialog()
     $decision=if($dlg.Tag){[string]$dlg.Tag}else{'Cancel'}
@@ -444,8 +459,20 @@ function Invoke-PresetCopy([string]$PresetName,[string[]]$Sources){
         }
         $destinations=@(Resolve-CopyDestinations -Sources $selected -RelativePath $relative -DriveLetters $available)
         $missingDirectories=@(Get-MissingDestinationDirectories $destinations)
-        if($missingDirectories.Count){
-            $question='コピー元: '+$selected.Count+' 項目'+[Environment]::NewLine+'コピー先: '+($destinations -join ', ')+[Environment]::NewLine+'新規作成するフォルダ:'+[Environment]::NewLine+($missingDirectories -join [Environment]::NewLine)+[Environment]::NewLine+'コピーしますか？'
+        # Direct preset runs skip the settings window, so surface duplicates here.
+        $check=Get-ZipDuplicateCheck -Sources $selected -Destinations $destinations
+        $duplicateCounts=Get-ZipDuplicateCounts @($check.Reports)
+        if($missingDirectories.Count -or $duplicateCounts.WithDuplicate -gt 0 -or $duplicateCounts.Unconfirmed -gt 0){
+            $question='コピー元: '+$selected.Count+' 項目'+[Environment]::NewLine+'コピー先: '+($destinations -join ', ')
+            if($missingDirectories.Count){$question+=[Environment]::NewLine+'新規作成するフォルダ:'+[Environment]::NewLine+($missingDirectories -join [Environment]::NewLine)}
+            if($duplicateCounts.WithDuplicate -gt 0){
+                $question+=[Environment]::NewLine+[Environment]::NewLine+'同名ZIPが '+$duplicateCounts.WithDuplicate+' 件あります。既定ではスキップし、上書きはしません。'
+                $question+=[Environment]::NewLine+[Environment]::NewLine+(Format-ZipDuplicateDetails @($check.Reports))
+            }
+            if($duplicateCounts.Unconfirmed -gt 0){
+                $question+=[Environment]::NewLine+'同名ZIPを確認できないコピー先が '+$duplicateCounts.Unconfirmed+' 件あります（未確認）。'
+            }
+            $question+=[Environment]::NewLine+[Environment]::NewLine+'コピーしますか？'
             if([Windows.Forms.MessageBox]::Show($question,'実行確認','YesNo','Question') -ne 'Yes'){return}
         }
         foreach($directory in $missingDirectories){New-Item -ItemType Directory -Path $directory -Force|Out-Null}
@@ -504,6 +531,7 @@ function Invoke-PresetCopy([string]$PresetName,[string[]]$Sources){
         $progressForm.Dispose()
         $progressForm=$null
         $summary='コピー: '+$script:copied+' 件 / スキップ: '+$script:skipped+' 件'
+        if($duplicateCounts.WithDuplicate -gt 0){$summary+=' / 同名ZIP: '+$duplicateCounts.WithDuplicate+' 件'}
         if($script:cancel){Show-CopyNotification 'コピーを中止しました' $summary 'Warning'}
         elseif($recycle){Show-CopyNotification 'コピーと検証が完了しました' $summary 'Info'}
         else{Show-CopyNotification 'コピーが完了しました' $summary 'Info'}
@@ -520,7 +548,7 @@ $form=New-Object Windows.Forms.Form
 $form.Text='Multi Drive Copy - E / F / G'
 if($SourceListFile){$form.Text='Multi Drive Copy - ソースリスト確認'}
 $form.StartPosition='CenterScreen'
-$form.Size=New-Object Drawing.Size(720,600)
+$form.Size=New-Object Drawing.Size(720,640)
 $form.KeyPreview=$true
 $form.Add_FormClosing({if($script:copying){$_.Cancel=$true}})
 $label=New-Object Windows.Forms.Label
@@ -528,29 +556,47 @@ if($SourceListFile){$label.Text='コピー元（外部アプリから受け取�
 else{$label.Text='コピー元（右クリック → 送る で選んだ項目）'}
 $label.SetBounds(15,15,670,22)
 $form.Controls.Add($label)
-$list=New-Object Windows.Forms.ListBox
+$list=New-Object Windows.Forms.ListView
 $list.SetBounds(15,42,670,155)
-$list.HorizontalScrollbar=$true
-foreach($src in $sourceItems){[void]$list.Items.Add($src)}
+$list.View='Details'
+$list.FullRowSelect=$true
+$list.MultiSelect=$false
+$list.HideSelection=$false
+$list.HeaderStyle='Nonclickable'
+[void]$list.Columns.Add('コピー元', 430)
+[void]$list.Columns.Add('同名ZIP', 210)
+foreach($src in $sourceItems){
+    $row=New-Object Windows.Forms.ListViewItem([string]$src)
+    [void]$row.SubItems.Add('—')
+    [void]$list.Items.Add($row)
+}
 $form.Controls.Add($list)
+$checkButton=Button '同名ZIPを確認' 15 200 150
+$checkButton.Height=26
+$form.Controls.Add($checkButton)
+$duplicateLabel=New-Object Windows.Forms.Label
+$duplicateLabel.Text='コピー先を決めてから「同名ZIPを確認」を押すと、既存ZIPとの重複を表示します。'
+$duplicateLabel.AutoEllipsis=$true
+$duplicateLabel.SetBounds(175,203,510,22)
+$form.Controls.Add($duplicateLabel)
 $label2=New-Object Windows.Forms.Label
 $label2.Text='保存済みコピー先パターン'
-$label2.SetBounds(15,215,300,22)
+$label2.SetBounds(15,240,300,22)
 $form.Controls.Add($label2)
 $combo=New-Object Windows.Forms.ComboBox
 $combo.DropDownStyle='DropDownList'
-$combo.SetBounds(15,242,320,28)
+$combo.SetBounds(15,267,320,28)
 foreach($name in $script:presets.Keys){[void]$combo.Items.Add($name)}
 $form.Controls.Add($combo)
-$save=Button 'パターン保存' 350 240 140
-$remove=Button 'パターン削除' 500 240 140
+$save=Button 'パターン保存' 350 265 140
+$remove=Button 'パターン削除' 500 265 140
 $form.Controls.Add($save);$form.Controls.Add($remove)
 $label3=New-Object Windows.Forms.Label
 $label3.Text='コピー先の共通相対パス（例: Backup\Photos）'
-$label3.SetBounds(15,287,670,24)
+$label3.SetBounds(15,312,670,24)
 $form.Controls.Add($label3)
 $pathbox=New-Object Windows.Forms.TextBox
-$pathbox.SetBounds(15,315,670,27)
+$pathbox.SetBounds(15,340,670,27)
 $form.Controls.Add($pathbox)
 $drives=@()
 for($i=0;$i -lt 3;$i++){
@@ -559,13 +605,13 @@ for($i=0;$i -lt 3;$i++){
     $cb.Text=$letter+':\'
     $cb.Tag=$letter
     $cb.Checked=$true
-    $cb.SetBounds((15+105*$i),377,95,25)
+    $cb.SetBounds((15+105*$i),402,95,25)
     $drives+=,$cb
     $form.Controls.Add($cb)
 }
 $recycle=New-Object Windows.Forms.CheckBox
 $recycle.Text='コピー後、検証済みの元データをごみ箱へ移動（パターン保存時に記録し、「送る」から1回で実行できます）'
-$recycle.SetBounds(15,405,670,25)
+$recycle.SetBounds(15,430,670,25)
 $recycle.Checked=$false
 $form.Controls.Add($recycle)
 $status=New-Object Windows.Forms.Label
@@ -574,15 +620,15 @@ if($SourceListFile){
     $status.Text='コピー元を '+$sourceItems.Count+' 件読み込みました。内容を確認してコピーしてください。'
     if($mergeResult.Duplicates -gt 0){$status.Text+='（重複 '+$mergeResult.Duplicates+' 件を除外）'}
 }
-$status.SetBounds(15,435,670,30)
+$status.SetBounds(15,460,670,30)
 $form.Controls.Add($status)
 $script:statusLabel=$status
 $progress=New-Object Windows.Forms.ProgressBar
-$progress.SetBounds(15,468,440,18)
+$progress.SetBounds(15,493,440,18)
 $progress.Minimum=0;$progress.Maximum=1;$progress.Value=0
 $form.Controls.Add($progress)
 $script:progressBar=$progress
-$copy=Button 'コピー開始' 475 470 210
+$copy=Button 'コピー開始' 475 495 210
 $copy.Height=36
 $form.Controls.Add($copy)
 $combo.Add_SelectedIndexChanged({
@@ -597,6 +643,80 @@ $combo.Add_SelectedIndexChanged({
         Persist
     }
 })
+# Resolves the current copy plan and refreshes the per-source duplicate status.
+# Returns $null when the plan is invalid so the caller can show the reason.
+function Update-ZipDuplicateView {
+    try{
+        $relative=Relative $pathbox.Text
+        $letters=@($drives|Where-Object {$_.Checked}|ForEach-Object {[string]$_.Tag})
+        $sources=@($list.Items|ForEach-Object {[string]$_.Text})
+        $destinations=@(Resolve-CopyDestinations -Sources $sources -RelativePath $relative -DriveLetters $letters)
+    }catch{
+        $duplicateLabel.Text='同名ZIPを確認できません: '+$_.Exception.Message
+        return $null
+    }
+    $check=Get-ZipDuplicateCheck -Sources $sources -Destinations $destinations
+    # Reports are keyed by ZIP path, which may sit inside a selected folder, so
+    # aggregate every report under each row's source path.
+    $reports=@($check.Reports)
+    foreach($item in $list.Items){
+        $sourceKey=([string]$item.Text).TrimEnd('\').ToLowerInvariant()
+        $prefix=$sourceKey+'\'
+        $owned=@($reports|Where-Object {
+            $key=([string]$_.Source).ToLowerInvariant()
+            $key -eq $sourceKey -or $key.StartsWith($prefix)
+        })
+        $text='—'
+        if($owned.Count){
+            $counts=Get-ZipDuplicateCounts $owned
+            if($counts.WithDuplicate -gt 0){
+                $text=Format-ZipDuplicateSummary $owned[0]
+                if($counts.WithDuplicate -gt 1){$text='同名ZIP: あり（'+$counts.WithDuplicate+' 件）'}
+                $item.ForeColor=[Drawing.Color]::FromArgb(180,60,0)
+            } elseif($counts.Unconfirmed -gt 0){
+                $text=Format-ZipDuplicateSummary $owned[0]
+                $item.ForeColor=[Drawing.Color]::FromArgb(150,110,0)
+            } else {
+                $text='同名ZIP: なし'
+                $item.ForeColor=[Drawing.Color]::FromArgb(0,110,0)
+            }
+        } else {
+            $item.ForeColor=[Drawing.SystemColors]::WindowText
+        }
+        $item.SubItems[1].Text=$text
+    }
+    $counts=Get-ZipDuplicateCounts $reports
+    if($counts.Total -eq 0){
+        $duplicateLabel.Text='コピー対象にZIPはありません。'
+    } elseif($counts.WithDuplicate -gt 0){
+        $duplicateLabel.Text='同名ZIPあり: '+$counts.WithDuplicate+' 件（既定でスキップします）'
+    } elseif($counts.Unconfirmed -gt 0){
+        $duplicateLabel.Text='同名ZIP: 未確認 '+$counts.Unconfirmed+' 件（コピー先を読み取れません）'
+    } else {
+        $duplicateLabel.Text='同名ZIP: なし（'+$counts.Total+' 件のZIPを確認）'
+    }
+    return $check
+}
+$checkButton.Add_Click({
+    try{
+        $check=Update-ZipDuplicateView
+        if($null -eq $check){return}
+        $details=Format-ZipDuplicateDetails @($check.Reports)
+        if(-not $details){
+            [Windows.Forms.MessageBox]::Show('コピー先に同名のZIPはありません。','同名ZIPの確認','OK','Information')|Out-Null
+            return
+        }
+        [Windows.Forms.MessageBox]::Show($details,'同名ZIPの確認','OK','Warning')|Out-Null
+    }catch{Alert $_.Exception.Message}
+})
+# Refresh the duplicate column whenever the copy plan changes, so the list is
+# already accurate before the user presses コピー開始.
+$refreshDuplicates={
+    try{ [void](Update-ZipDuplicateView) }catch{}
+}
+foreach($cb in $drives){$cb.Add_CheckedChanged($refreshDuplicates)}
+$pathbox.Add_Leave($refreshDuplicates)
+$form.Add_Shown($refreshDuplicates)
 $save.Add_Click({
     try{
         $p=Relative $pathbox.Text
@@ -630,16 +750,27 @@ $copy.Add_Click({
         if(!$list.Items.Count){throw 'コピー元がありません。「送る」から起動してください。'}
         $relative=Relative $pathbox.Text
         $letters=@($drives|Where-Object {$_.Checked}|ForEach-Object {[string]$_.Tag})
-        $sources=@($list.Items|ForEach-Object {[string]$_})
+        $sources=@($list.Items|ForEach-Object {[string]$_.Text})
         $destinations=@(Resolve-CopyDestinations -Sources $sources -RelativePath $relative -DriveLetters $letters)
         $missingDirectories=@(Get-MissingDestinationDirectories $destinations)
+        # Re-check right before copying so a ZIP created after the earlier check
+        # cannot be overwritten without the user seeing it.
+        $check=Get-ZipDuplicateCheck -Sources $sources -Destinations $destinations
+        $duplicateCounts=Get-ZipDuplicateCounts @($check.Reports)
         $question='コピー元: '+$list.Items.Count+' 項目'+[Environment]::NewLine+'コピー先: '+($destinations -join ', ')+[Environment]::NewLine+'コピーしますか？'
         if($missingDirectories.Count){$question+=[Environment]::NewLine+'新規作成するフォルダ:'+[Environment]::NewLine+($missingDirectories -join [Environment]::NewLine)}
+        if($duplicateCounts.WithDuplicate -gt 0){
+            $question+=[Environment]::NewLine+[Environment]::NewLine+'同名ZIPが '+$duplicateCounts.WithDuplicate+' 件あります。既定ではスキップし、上書きはしません。'
+            $question+=[Environment]::NewLine+[Environment]::NewLine+(Format-ZipDuplicateDetails @($check.Reports))
+        }
+        if($duplicateCounts.Unconfirmed -gt 0){
+            $question+=[Environment]::NewLine+'同名ZIPを確認できないコピー先が '+$duplicateCounts.Unconfirmed+' 件あります（未確認）。'
+        }
         if($recycle.Checked){$question+=[Environment]::NewLine+'コピー後にSHA-256で検証し、確認のうえ検証済みの元データをごみ箱へ移動します。'}
         if([Windows.Forms.MessageBox]::Show($question,'実行確認','YesNo','Question') -ne 'Yes'){return}
         foreach($directory in $missingDirectories){New-Item -ItemType Directory -Path $directory -Force|Out-Null}
         $script:copying=$true
-        foreach($control in @($list,$combo,$save,$remove,$pathbox,$copy,$recycle)+$drives){$control.Enabled=$false}
+        foreach($control in @($list,$combo,$save,$remove,$pathbox,$copy,$recycle,$checkButton)+$drives){$control.Enabled=$false}
         $form.Cursor='WaitCursor'
         Start-CopyOperation -Sources $sources -Destinations $destinations
         if($recycle.Checked -and -not $script:cancel){
@@ -665,11 +796,18 @@ $copy.Add_Click({
         } else {
             $status.Text='コピー: '+$script:copied+' 件 / スキップ: '+$script:skipped+' 件'
             $heading=if($script:cancel){'処理を中止しました。'}else{'コピーが完了しました。'}
-            [Windows.Forms.MessageBox]::Show($heading+' '+$status.Text,'結果','OK','Information')|Out-Null
+            $resultText=$heading+' '+$status.Text
+            if($duplicateCounts.WithDuplicate -gt 0){
+                $resultText+=[Environment]::NewLine+[Environment]::NewLine+'同名ZIPが '+$duplicateCounts.WithDuplicate+' 件あったため、既存ファイルは上書きせずスキップしました。'
+            }
+            if($duplicateCounts.Unconfirmed -gt 0){
+                $resultText+=[Environment]::NewLine+'同名ZIPを確認できなかったコピー先が '+$duplicateCounts.Unconfirmed+' 件あります（未確認）。'
+            }
+            [Windows.Forms.MessageBox]::Show($resultText,'結果','OK','Information')|Out-Null
             Complete-CopyAndClose $form
         }
     }catch{Alert ('コピーエラー: '+$_.Exception.Message+' （途中までコピーされている場合があります）')}
-    finally{$script:copying=$false;foreach($control in @($list,$combo,$save,$remove,$pathbox,$copy,$recycle)+$drives){$control.Enabled=$true};$form.Cursor='Default'}
+    finally{$script:copying=$false;foreach($control in @($list,$combo,$save,$remove,$pathbox,$copy,$recycle,$checkButton)+$drives){$control.Enabled=$true};$form.Cursor='Default'}
 })
 $form.Add_KeyDown({
     if($_.Control -and $_.KeyCode -eq 'Enter'){$copy.PerformClick()}

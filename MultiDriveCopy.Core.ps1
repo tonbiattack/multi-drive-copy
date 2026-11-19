@@ -163,6 +163,248 @@ function Get-MissingDestinationDirectories {
     return @($missing)
 }
 
+function Test-ZipFileName {
+    param([string]$Name)
+
+    if (-not $Name) { return $false }
+    return ([IO.Path]::GetExtension([string]$Name) -eq '.zip')
+}
+
+# Maps every ZIP that would be copied to the exact path it would land on, so the
+# duplicate check covers both directly selected ZIPs and ZIPs inside folders.
+function Get-ZipCopyTargets {
+    param(
+        [string[]]$Sources,
+        [string[]]$Destinations
+    )
+
+    $targets = New-Object System.Collections.ArrayList
+    foreach ($destination in @($Destinations)) {
+        if (-not $destination) { continue }
+        foreach ($source in @($Sources)) {
+            if (-not $source) { continue }
+            $trimmed = ([string]$source).TrimEnd('\')
+            if ([IO.File]::Exists($trimmed)) {
+                $name = [IO.Path]::GetFileName($trimmed)
+                if (-not (Test-ZipFileName $name)) { continue }
+                [void]$targets.Add([pscustomobject]@{
+                    Source = $trimmed
+                    Name = $name
+                    TargetPath = (Join-Path $destination $name)
+                    TargetDirectory = [string]$destination
+                })
+                continue
+            }
+            if (-not [IO.Directory]::Exists($trimmed)) { continue }
+            $folderName = [IO.Path]::GetFileName($trimmed)
+            $root = Join-Path $destination $folderName
+            try {
+                $files = [IO.Directory]::EnumerateFiles($trimmed, '*', [IO.SearchOption]::AllDirectories)
+            } catch {
+                continue
+            }
+            foreach ($file in $files) {
+                $name = [IO.Path]::GetFileName($file)
+                if (-not (Test-ZipFileName $name)) { continue }
+                $relative = ([string]$file).Substring($trimmed.Length).TrimStart('\')
+                $targetPath = Join-Path $root $relative
+                [void]$targets.Add([pscustomobject]@{
+                    Source = [string]$file
+                    Name = $name
+                    TargetPath = $targetPath
+                    TargetDirectory = [IO.Path]::GetDirectoryName($targetPath)
+                })
+            }
+        }
+    }
+    return @($targets)
+}
+
+# Indexes the files of each destination folder once so a large source list does
+# not rescan the same folder for every entry. A folder that cannot be read is
+# recorded as unreadable instead of being reported as empty.
+function Get-DestinationFileIndex {
+    param([string[]]$Directories)
+
+    $index = @{}
+    foreach ($directory in @($Directories)) {
+        if (-not $directory) { continue }
+        $key = ([string]$directory).ToLowerInvariant()
+        if ($index.ContainsKey($key)) { continue }
+        $entry = @{ Directory = [string]$directory; Readable = $false; Files = @{}; Error = '' }
+        try {
+            if ([IO.Directory]::Exists($directory)) {
+                $files = @{}
+                foreach ($file in [IO.Directory]::EnumerateFiles($directory, '*', [IO.SearchOption]::TopDirectoryOnly)) {
+                    $name = [IO.Path]::GetFileName($file)
+                    $nameKey = $name.ToLowerInvariant()
+                    if (-not $files.ContainsKey($nameKey)) {
+                        $files[$nameKey] = [pscustomobject]@{ Name = $name; Path = $file; Length = ([IO.FileInfo]$file).Length }
+                    }
+                }
+                $entry.Files = $files
+                $entry.Readable = $true
+            } else {
+                # A folder that does not exist yet cannot hold a duplicate.
+                $entry.Readable = $true
+            }
+        } catch {
+            $entry.Error = $_.Exception.Message
+        }
+        $index[$key] = $entry
+    }
+    return $index
+}
+
+# Compares each ZIP copy target against the indexed destination folder and
+# reports whether a same-named ZIP already exists. One report is produced per
+# source ZIP, covering every destination it would be copied to. Size equality is
+# reported but never treated as proof that the contents match.
+function Get-ZipDuplicateReport {
+    param(
+        [object[]]$Targets,
+        [hashtable]$Index
+    )
+
+    if (-not $Index) { $Index = @{} }
+    $order = New-Object System.Collections.ArrayList
+    $grouped = @{}
+    foreach ($target in @($Targets)) {
+        if ($null -eq $target) { continue }
+        $sourceKey = ([string]$target.Source).ToLowerInvariant()
+        if (-not $grouped.ContainsKey($sourceKey)) {
+            $grouped[$sourceKey] = @{
+                Source = [string]$target.Source
+                Name = [string]$target.Name
+                TargetPath = [string]$target.TargetPath
+                Targets = New-Object System.Collections.ArrayList
+            }
+            [void]$order.Add($sourceKey)
+        }
+        [void]$grouped[$sourceKey].Targets.Add($target)
+    }
+
+    $results = New-Object System.Collections.ArrayList
+    foreach ($sourceKey in $order) {
+        $group = $grouped[$sourceKey]
+        $sourceLength = 0
+        try { $sourceLength = ([IO.FileInfo]$group.Source).Length } catch { continue }
+
+        $matches = New-Object System.Collections.ArrayList
+        $unconfirmed = New-Object System.Collections.ArrayList
+        foreach ($target in @($group.Targets)) {
+            $nameKey = ([string]$target.Name).ToLowerInvariant()
+            $directoryKey = ([string]$target.TargetDirectory).ToLowerInvariant()
+            if (-not $Index.ContainsKey($directoryKey)) {
+                [void]$unconfirmed.Add([pscustomobject]@{
+                    Directory = [string]$target.TargetDirectory
+                    Path = ''
+                    Reason = 'コピー先を確認できませんでした'
+                })
+                continue
+            }
+            $entry = $Index[$directoryKey]
+            if (-not $entry.Readable) {
+                [void]$unconfirmed.Add([pscustomobject]@{
+                    Directory = [string]$target.TargetDirectory
+                    Path = ''
+                    Reason = 'コピー先を読み取れません: ' + $entry.Error
+                })
+                continue
+            }
+            if (-not $entry.Files.ContainsKey($nameKey)) { continue }
+            $existing = $entry.Files[$nameKey]
+            $state = if ($existing.Length -eq $sourceLength) { 'SameSize' } else { 'DifferentSize' }
+            [void]$matches.Add([pscustomobject]@{
+                Directory = [string]$target.TargetDirectory
+                Path = [string]$existing.Path
+                ExistingSize = [long]$existing.Length
+                SourceSize = [long]$sourceLength
+                State = $state
+            })
+        }
+        [void]$results.Add([pscustomobject]@{
+            Source = [string]$group.Source
+            Name = [string]$group.Name
+            TargetPath = [string]$group.TargetPath
+            SourceSize = [long]$sourceLength
+            Matches = @($matches)
+            Unconfirmed = @($unconfirmed)
+        })
+    }
+    return @($results)
+}
+
+# Runs the whole duplicate check for a copy plan: map ZIPs, index the folders
+# they would land in, then compare. Returns reports plus the index for reuse.
+function Get-ZipDuplicateCheck {
+    param(
+        [string[]]$Sources,
+        [string[]]$Destinations
+    )
+
+    $targets = @(Get-ZipCopyTargets -Sources $Sources -Destinations $Destinations)
+    $directories = @($targets | ForEach-Object { [string]$_.TargetDirectory } | Sort-Object -Unique)
+    $index = Get-DestinationFileIndex -Directories $directories
+    $reports = @(Get-ZipDuplicateReport -Targets $targets -Index $index)
+    return @{ Targets = $targets; Index = $index; Reports = $reports }
+}
+
+# Builds the one-line summary shown in the source list for a duplicate report.
+function Format-ZipDuplicateSummary {
+    param($Report)
+
+    if ($null -eq $Report) { return '' }
+    $matches = @($Report.Matches)
+    $unconfirmed = @($Report.Unconfirmed)
+    if ($unconfirmed.Count) {
+        return ('同名ZIP: 未確認 ' + $unconfirmed.Count + ' 件（' + (@($unconfirmed | ForEach-Object { $_.Directory }) -join ', ') + '）')
+    }
+    if (-not $matches.Count) { return '同名ZIP: なし' }
+    $sameSize = @($matches | Where-Object { $_.State -eq 'SameSize' }).Count
+    $differentSize = $matches.Count - $sameSize
+    $parts = New-Object System.Collections.ArrayList
+    if ($sameSize) { [void]$parts.Add('同名・同サイズ ' + $sameSize + ' 件') }
+    if ($differentSize) { [void]$parts.Add('同名・サイズ違い ' + $differentSize + ' 件') }
+    return ('同名ZIP: あり（' + ($parts -join ' / ') + '）')
+}
+
+# Describes every duplicate in detail for the confirmation dialog.
+function Format-ZipDuplicateDetails {
+    param([object[]]$Reports)
+
+    $builder = New-Object System.Text.StringBuilder
+    foreach ($report in @($Reports)) {
+        if ($null -eq $report) { continue }
+        $matches = @($report.Matches)
+        $unconfirmed = @($report.Unconfirmed)
+        if (-not $matches.Count -and -not $unconfirmed.Count) { continue }
+        [void]$builder.AppendLine($report.Name + '  (' + (Format-FileSize $report.SourceSize) + ')')
+        foreach ($match in $matches) {
+            $label = if ($match.State -eq 'SameSize') { '同名・同サイズ' } else { '同名・サイズ違い' }
+            [void]$builder.AppendLine('  [' + $label + '] ' + $match.Path + '  (' + (Format-FileSize $match.ExistingSize) + ')')
+        }
+        foreach ($item in $unconfirmed) {
+            [void]$builder.AppendLine('  [未確認] ' + $item.Directory + ' — ' + $item.Reason)
+        }
+    }
+    return $builder.ToString()
+}
+
+# Counts the reports that need the user's attention before copying.
+function Get-ZipDuplicateCounts {
+    param([object[]]$Reports)
+
+    $withDuplicate = 0
+    $unconfirmed = 0
+    foreach ($report in @($Reports)) {
+        if ($null -eq $report) { continue }
+        if (@($report.Matches).Count) { $withDuplicate++ }
+        if (@($report.Unconfirmed).Count) { $unconfirmed++ }
+    }
+    return @{ WithDuplicate = $withDuplicate; Unconfirmed = $unconfirmed; Total = @($Reports).Count }
+}
+
 function Get-PresetSettings {
     param([string]$Path)
 
